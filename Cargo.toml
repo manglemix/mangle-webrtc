@@ -1,0 +1,9 @@
+[workspace]
+
+members = [
+    "upgrade2webrtc",
+]
+
+[workspace.dependencies]
+webrtc = "0.9"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "macros", "sync", "signal", "parking_lot"] }
