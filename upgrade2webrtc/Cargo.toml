@@ -6,3 +6,13 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+tokio = { workspace = true }
+webrtc = { workspace = true }
+serde = { workspace = true }
+bitcode = { workspace = true }
+futures = { workspace = true }
+hex = { workspace = true }
+interprocess = { workspace = true }
+rcgen = "0.11.3"
+tokio-rustls = "0.24.1"
+rustls-pemfile = "1.0.3"
