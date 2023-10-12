@@ -1,5 +1,6 @@
-use std::ops::ControlFlow;
+use std::time::SystemTime;
 
+use anyhow::anyhow;
 use clap::{Parser, Subcommand};
 use serde::Deserialize;
 use upgrade2webrtc::{
@@ -13,6 +14,7 @@ struct ClientConfig {
     #[serde(default)]
     use_tls: bool,
     root_cert_path: Option<String>,
+    domain_name: Option<String>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -58,6 +60,21 @@ struct Args {
 async fn main() -> anyhow::Result<()> {
     let Args { command } = Args::parse();
 
+    fern::Dispatch::new()
+        .format(|out, message, record| {
+            out.finish(format_args!(
+                "[{} {} {}] {}",
+                humantime::format_rfc3339_seconds(SystemTime::now()),
+                record.level(),
+                record.target(),
+                message
+            ))
+        })
+        .level(log::LevelFilter::Info)
+        .chain(std::io::stdout())
+        // .chain(fern::log_file("output.log")?)
+        .apply()?;
+
     match command {
         Command::Client {
             stream_type,
@@ -72,9 +89,11 @@ async fn main() -> anyhow::Result<()> {
             match stream_type {
                 ClientStreamType::TCP { addr } => {
                     let domain = ServerName::try_from(
-                        addr.split(":")
-                            .next()
-                            .ok_or(anyhow::anyhow!("Invalid socket address"))?,
+                        config
+                            .domain_name
+                            .as_ref()
+                            .ok_or(anyhow!("Missing domain name"))?
+                            .as_str(),
                     )?;
                     let mut client = client_new_tcp(addr).await?;
                     let peer = if config.use_tls {

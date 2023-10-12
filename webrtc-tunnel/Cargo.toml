@@ -8,10 +8,13 @@ edition = "2021"
 [dependencies]
 tokio = { workspace = true }
 serde = { workspace = true }
+log = { workspace = true }
 toml = "0.8"
 upgrade2webrtc = { path = "../upgrade2webrtc", features = ["local_sockets"]}
 clap = { version = "4", features = ["derive"]}
 anyhow = "1"
+fern = "0.6"
+humantime = "2"
 
 [features]
 server = []

@@ -1,6 +1,6 @@
 use std::{fmt::Display, fs::File, io::BufReader, path::Path, sync::Arc};
 
-use rcgen::SanType;
+use rcgen::{KeyPair, generate_simple_self_signed, CertificateParams};
 use serde::{Deserialize, Serialize};
 use tokio_rustls::{
     rustls::{self, ClientConfig, RootCertStore, ServerConfig},
@@ -57,62 +57,60 @@ impl From<rustls::Error> for TlsInitError {
 }
 
 pub(crate) fn new_tls_acceptor(config: &TlsServerConfig) -> Result<TlsAcceptor, TlsInitError> {
-    let root_cert_path: &Path = config.root_cert_chain_path.as_ref();
+    let parent_certs_path: &Path = config.root_cert_chain_path.as_ref();
     let parent_key_path: &Path = config.parent_key_path.as_ref();
     let mut server_certs = vec![];
     let server_key;
+    let parent_cert;
 
-    if root_cert_path.try_exists()? {
-        let mut root_key_file = BufReader::new(File::open(parent_key_path)?);
-        let keys = rustls_pemfile::pkcs8_private_keys(&mut root_key_file)?;
+    // let subject_alt_names = config
+    //     .subject_alt_names
+    //     .iter()
+    //     .cloned()
+    //     .map(|s| match s.parse() {
+    //         Ok(ip) => SanType::IpAddress(ip),
+    //         Err(_) => SanType::DnsName(s),
+    //     })
+    //     .collect::<Vec<_>>();
+
+    if parent_certs_path.try_exists()? {
+        let mut parent_key_file = BufReader::new(File::open(parent_key_path)?);
+        let keys = rustls_pemfile::pkcs8_private_keys(&mut parent_key_file)?;
         let [parent_key] = keys.as_slice() else {
             return Err(TlsInitError::IOError(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "There must be exactly one private key in the parent key file",
             )));
         };
-        let root_key = rcgen::KeyPair::from_der(parent_key)?;
-        let mut root_cert_file = BufReader::new(File::open(root_cert_path)?);
-        let certs = rustls_pemfile::certs(&mut root_cert_file)?;
-        let Some(parent_cert) = certs.last() else {
+        let parent_key = KeyPair::from_der(parent_key)?;
+        let mut parent_certs_file = BufReader::new(File::open(parent_certs_path)?);
+        let certs = rustls_pemfile::certs(&mut parent_certs_file)?;
+        let Some(parent_cert_der) = certs.last() else {
             return Err(TlsInitError::IOError(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "There must be at least one certificate in the root cert chain file",
             )));
         };
-        let mut cert_params = rcgen::CertificateParams::from_ca_cert_der(parent_cert, root_key)?;
+        parent_cert = rcgen::Certificate::from_params(CertificateParams::from_ca_cert_der(parent_cert_der, parent_key)?)?;
 
-        let subject_alt_names = config
-            .subject_alt_names
-            .iter()
-            .cloned()
-            .map(|s| match s.parse() {
-                Ok(ip) => SanType::IpAddress(ip),
-                Err(_) => SanType::DnsName(s),
-            })
-            .collect::<Vec<_>>();
-
-        cert_params.subject_alt_names = subject_alt_names;
-        let rcgen_server_cert = rcgen::Certificate::from_params(cert_params)?;
-        server_key = rustls::PrivateKey(rcgen_server_cert.serialize_private_key_der());
-        server_certs.push(rustls::Certificate(rcgen_server_cert.serialize_der()?));
     } else if config.create_if_missing {
-        let root_cert = rcgen::generate_simple_self_signed([])?;
-        let rcgen_server_cert =
-            rcgen::generate_simple_self_signed(config.subject_alt_names.clone())?;
-        server_certs.push(rustls::Certificate(root_cert.serialize_der()?));
-        server_certs.push(rustls::Certificate(
-            rcgen_server_cert.serialize_der_with_signer(&root_cert)?,
-        ));
-        server_key = rustls::PrivateKey(rcgen_server_cert.serialize_private_key_der());
-        std::fs::write(root_cert_path, root_cert.serialize_pem()?)?;
-        std::fs::write(parent_key_path, root_cert.get_key_pair().serialize_pem())?;
+        parent_cert = generate_simple_self_signed([])?;
+        std::fs::write(parent_certs_path, parent_cert.serialize_pem()?)?;
+        std::fs::write(parent_key_path, parent_cert.get_key_pair().serialize_pem())?;
+
     } else {
         return Err(TlsInitError::IOError(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             "Certificate file does not exist",
         )));
     }
+
+    let rcgen_server_cert = generate_simple_self_signed(config.subject_alt_names.clone())?;
+    server_certs.push(rustls::Certificate(
+        rcgen_server_cert.serialize_der_with_signer(&parent_cert)?,
+    ));
+    server_certs.push(rustls::Certificate(parent_cert.serialize_der()?));
+    server_key = rustls::PrivateKey(rcgen_server_cert.serialize_private_key_der());
 
     let config = ServerConfig::builder()
         .with_safe_defaults()

@@ -126,7 +126,7 @@ impl<T: AsyncWrite + AsyncRead + Send + Sync + Unpin + 'static> UpgradeTransport
                 let buf = self.recv_buffer.split_at(size).0.split_at(4).1;
                 let result = bitcode::deserialize(buf).map_err(RecvError::DeserializeError);
                 self.recv_buffer.drain(0..size);
-                return result
+                return result;
             }
         }
 
