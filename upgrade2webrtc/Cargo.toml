@@ -10,9 +10,13 @@ tokio = { workspace = true }
 webrtc = { workspace = true }
 serde = { workspace = true }
 bitcode = { workspace = true }
-futures = { workspace = true }
 hex = { workspace = true }
-interprocess = { workspace = true }
-rcgen = "0.11.3"
-tokio-rustls = "0.24.1"
-rustls-pemfile = "1.0.3"
+interprocess = { workspace = true, optional = true}
+rcgen = "0.11"
+tokio-rustls = "0.24"
+rustls-pemfile = "1"
+tokio-util = { version = "0.7", features = ["compat"], optional = true }
+async-trait = { workspace = true }
+
+[features]
+local_sockets = ["interprocess", "tokio-util"]

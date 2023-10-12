@@ -1,21 +1,44 @@
-use std::{ops::ControlFlow, sync::Arc};
+use std::{fmt::Display, future::Future, sync::Arc};
 
-use futures::{stream::FuturesUnordered, Future, StreamExt};
-use tokio::net::{TcpListener, ToSocketAddrs};
+use async_trait::async_trait;
+use tokio::{
+    io::{AsyncRead, AsyncWrite},
+    net::{TcpListener, ToSocketAddrs},
+    sync::mpsc,
+};
+use tokio_rustls::TlsAcceptor;
 use webrtc::{
-    api::{APIBuilder, API, media_engine::MediaEngine, interceptor_registry::register_default_interceptors},
+    api::{
+        interceptor_registry::register_default_interceptors, media_engine::MediaEngine, APIBuilder,
+        API,
+    },
     ice_transport::{ice_candidate::RTCIceCandidate, ice_server::RTCIceServer},
+    interceptor::registry::Registry,
     peer_connection::{
         configuration::RTCConfiguration, sdp::session_description::RTCSessionDescription,
         RTCPeerConnection,
-    }, interceptor::registry::Registry,
+    },
 };
 
-use crate::{transport::{IDUpgradeTransport, RecvError, UpgradeTransport, UpgradeTransportServer}, RTCMessage};
+use crate::{
+    tls::{new_tls_acceptor, TlsInitError, TlsServerConfig},
+    transport::{
+        IDUpgradeTransport, RecvError, StreamTransport, UpgradeTransport, UpgradeTransportServer,
+    },
+    RTCMessage,
+};
+
+pub struct ServerHandle(mpsc::Sender<()>);
+
+impl ServerHandle {
+    pub fn close_server(&self) {
+        let _ = self.0.try_send(());
+    }
+}
 
 pub struct UpgradeWebRTCServer<S: UpgradeTransportServer> {
     server: S,
-    api: API,
+    api: Arc<API>,
     config: RTCConfiguration,
 }
 
@@ -30,120 +53,138 @@ pub enum ServerError<AE, DE> {
 impl<S: UpgradeTransportServer> UpgradeWebRTCServer<S> {
     pub fn new(server: S) -> Self {
         let mut m = MediaEngine::default();
-        m.register_default_codecs().expect("Default codecs should have registered safely");
+        m.register_default_codecs()
+            .expect("Default codecs should have registered safely");
 
         let mut registry = Registry::new();
 
         // Use the default set of Interceptors
-        registry = register_default_interceptors(registry, &mut m).expect("Default interceptors should have registered safely");
+        registry = register_default_interceptors(registry, &mut m)
+            .expect("Default interceptors should have registered safely");
 
         Self {
             server,
-            api: APIBuilder::new()
-                .with_media_engine(m)
-                .with_interceptor_registry(registry)
-                .build(),
+            api: Arc::new(
+                APIBuilder::new()
+                    .with_media_engine(m)
+                    .with_interceptor_registry(registry)
+                    .build(),
+            ),
             config: RTCConfiguration {
                 ice_servers: vec![RTCIceServer {
                     urls: vec!["stun:stun.l.google.com:19302".to_owned()],
                     ..Default::default()
                 }],
                 ..Default::default()
-            }
+            },
         }
     }
 
-    pub async fn run<V, F1, F2>(
+    pub async fn run<F1, F2>(
         &mut self,
-        on_success: impl Fn(RTCPeerConnection) -> F1,
+        on_success: impl Fn(RTCPeerConnection, ServerHandle) -> F1 + Send + Sync + 'static,
         on_err: impl Fn(
-            ServerError<
-                S::AcceptError,
-                <S::UpgradeTransport as UpgradeTransport>::DeserializationError,
-            >,
-        ) -> F2,
-    ) -> V
-    where
-        F1: Future<Output = ()>,
-        F2: Future<Output = ControlFlow<V, ()>>,
+                ServerError<
+                    S::AcceptError,
+                    <S::UpgradeTransport as UpgradeTransport>::DeserializationError,
+                >,
+                ServerHandle,
+            ) -> F2
+            + Send
+            + Sync
+            + 'static,
+    ) where
+        F1: Future<Output = ()> + Send,
+        F2: Future<Output = ()> + Send,
     {
-        let mut pending_peers = FuturesUnordered::new();
+        let on_success = Arc::new(on_success);
+        let on_err = Arc::new(on_err);
+        let mut running_tasks = vec![];
+        let (close_sender, mut close_recv) = mpsc::channel(1);
 
         loop {
             tokio::select! {
                 result = self.server.accept() => {
-                    let transport = match result {
+                    let mut transport = match result {
                         Ok(x) => x,
-                        Err(e) => if let ControlFlow::Break(x) = on_err(ServerError::AcceptError(e)).await {
-                            break x
-                        } else {
+                        Err(e) => {
+                            on_err(ServerError::AcceptError(e), ServerHandle(close_sender.clone())).await;
                             continue
                         }
                     };
-                    pending_peers.push(async {
-                        let mut transport = transport;
 
+                    let api = self.api.clone();
+                    let config = self.config.clone();
+                    let on_err = on_err.clone();
+                    let on_success = on_success.clone();
+                    let close_sender = close_sender.clone();
+
+                    running_tasks.push(tokio::spawn(async move {
                         loop {
                             let offer: RTCSessionDescription = match transport.recv_obj().await {
                                 Ok(x) => x,
-                                Err(RecvError::DeserializeError(error)) => return on_err(ServerError::<S::AcceptError, _>::BadMessage {
+                                Err(RecvError::DeserializeError(error)) => {
+                                    on_err(ServerError::<S::AcceptError, _>::BadMessage {
                                         error,
                                         client_id: transport.get_id()
-                                    }).await,
-                                Err(RecvError::IOError(e)) => 
-                                    return on_err(ServerError::IOError(e)).await
+                                    }, ServerHandle(close_sender)).await;
+                                    return
+                                }
+                                Err(RecvError::IOError(e)) => {
+                                    on_err(ServerError::IOError(e), ServerHandle(close_sender)).await;
+                                    return
+                                }
                             };
-    
-                            let peer = match self.api.new_peer_connection(self.config.clone()).await {
+
+                            let peer = match api.new_peer_connection(config.clone()).await {
                                 Ok(x) => x,
-                                Err(e) => return on_err(ServerError::WebRTCError(e)).await
+                                Err(e) => return on_err(ServerError::WebRTCError(e), ServerHandle(close_sender)).await
                             };
-    
+
                             macro_rules! returning {
                                 ($val: expr) => {{
                                     let _ = peer.close().await;
                                     return $val
                                 }}
                             }
-    
+
                             macro_rules! webrtc_unwrap {
                                 ($result: expr) => {
                                     match $result {
                                         Ok(x) => x,
-                                        Err(e) => returning!(on_err(ServerError::WebRTCError(e)).await)
+                                        Err(e) => returning!(on_err(ServerError::WebRTCError(e), ServerHandle(close_sender)).await)
                                     }
                                 };
                             }
                             let _data_channel = webrtc_unwrap!(peer.create_data_channel("command", None).await);
-    
-                            let (ice_sender, mut ice_receiver) = tokio::sync::mpsc::channel(3);
+
+                            let (ice_sender, mut ice_receiver) = mpsc::channel(3);
                             let ice_sender = Arc::new(ice_sender);
-    
+
                             peer.on_ice_candidate(Box::new(move |c: Option<RTCIceCandidate>| {
                                 let ice_sender = ice_sender.clone();
                                 Box::pin(async move { let _ = ice_sender.send(c).await; })
                             }));
-    
+
                             webrtc_unwrap!(peer.set_remote_description(offer).await);
                             let answer = RTCMessage::SDPAnswer(webrtc_unwrap!(peer.create_answer(None).await));
                             if let Err(e) = transport.send_obj(&answer).await {
-                                returning!(on_err(ServerError::IOError(e)).await)
+                                returning!(on_err(ServerError::IOError(e), ServerHandle(close_sender)).await)
                             }
                             let RTCMessage::SDPAnswer(answer) = answer else { unreachable!() };
                             webrtc_unwrap!(peer.set_local_description(answer).await);
-    
+
                             let mut done_sending_ice = false;
                             let mut done_receiving_ice = false;
-    
+
                             loop {
                                 tokio::select! {
                                     ice_to_send = ice_receiver.recv() => {
                                         let ice_to_send = ice_to_send.unwrap();
                                         let ice_to_send = webrtc_unwrap!(ice_to_send.map(|x| x.to_json()).transpose());
                                         let ice_to_send = ice_to_send.map(RTCMessage::ICE);
-                                        println!("s send {}", ice_to_send.is_some());
                                         if let Err(e) = transport.send_obj(&ice_to_send).await {
-                                            returning!(on_err(ServerError::IOError(e)).await);  
+                                            returning!(on_err(ServerError::IOError(e), ServerHandle(close_sender)).await);
                                         }
                                         if ice_to_send.is_none() {
                                             done_sending_ice = true;
@@ -155,10 +196,9 @@ impl<S: UpgradeTransportServer> UpgradeWebRTCServer<S> {
                                     received_ice = transport.recv_obj::<Option<RTCIceCandidate>>() => {
                                         let received_ice = match received_ice {
                                             Ok(x) => x,
-                                            Err(RecvError::DeserializeError(error)) => returning!(on_err(ServerError::BadMessage { error, client_id: transport.get_id() }).await),
-                                            Err(RecvError::IOError(e)) => returning!(on_err(ServerError::IOError(e)).await)
+                                            Err(RecvError::DeserializeError(error)) => returning!(on_err(ServerError::BadMessage { error, client_id: transport.get_id() }, ServerHandle(close_sender)).await),
+                                            Err(RecvError::IOError(e)) => returning!(on_err(ServerError::IOError(e), ServerHandle(close_sender)).await)
                                         };
-                                        println!("s {}", received_ice.is_some());
                                         let Some(received_ice) = received_ice else {
                                             done_receiving_ice = true;
                                             if done_sending_ice {
@@ -171,20 +211,122 @@ impl<S: UpgradeTransportServer> UpgradeWebRTCServer<S> {
                                     }
                                 }
                             }
-    
-                            on_success(peer).await;
+
+                            on_success(peer, ServerHandle(close_sender.clone())).await;
                         }
-                    });
+                    }));
                 }
-                result = pending_peers.next() => {
-                    let Some(ControlFlow::Break(err)) = result else { continue };
-                    return err
+                _ = close_recv.recv() => {
+                    break
                 }
             }
+        }
+
+        for handle in &running_tasks {
+            handle.abort();
+        }
+
+        for handle in running_tasks {
+            let _ = handle.await;
         }
     }
 }
 
-pub async fn server_new_tcp(addr: impl ToSocketAddrs) -> std::io::Result<UpgradeWebRTCServer<TcpListener>> {
+pub struct TlsUpgradeTransportServer<S: UpgradeTransportServer> {
+    server: S,
+    acceptor: TlsAcceptor,
+}
+
+#[derive(Debug)]
+pub enum TlsAcceptError<E> {
+    AcceptError(E),
+    IOError(std::io::Error),
+}
+
+impl<E: std::fmt::Debug + std::fmt::Display> std::error::Error for TlsAcceptError<E> {}
+
+impl<E: Display> Display for TlsAcceptError<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TlsAcceptError::AcceptError(e) => write!(f, "{e}"),
+            TlsAcceptError::IOError(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl<E> From<std::io::Error> for TlsAcceptError<E> {
+    fn from(value: std::io::Error) -> Self {
+        Self::IOError(value)
+    }
+}
+
+#[async_trait]
+impl<C, S> UpgradeTransportServer for TlsUpgradeTransportServer<S>
+where
+    C: AsyncWrite + AsyncRead + Send + Sync + Unpin + 'static + IDUpgradeTransport,
+    S: UpgradeTransportServer<UpgradeTransport = StreamTransport<C>>,
+{
+    type AcceptError = TlsAcceptError<S::AcceptError>;
+
+    type UpgradeTransport = StreamTransport<tokio_rustls::server::TlsStream<C>>;
+
+    async fn accept(&mut self) -> Result<Self::UpgradeTransport, Self::AcceptError> {
+        let stream = self
+            .acceptor
+            .accept(
+                self.server
+                    .accept()
+                    .await
+                    .map_err(|e| TlsAcceptError::AcceptError(e))?
+                    .stream,
+            )
+            .await?;
+        Ok(StreamTransport::from(stream))
+    }
+}
+
+impl<C, S> UpgradeWebRTCServer<S>
+where
+    C: AsyncWrite + AsyncRead + Send + Sync + Unpin + 'static + IDUpgradeTransport,
+    S: UpgradeTransportServer<UpgradeTransport = StreamTransport<C>>,
+{
+    pub fn add_tls(
+        self,
+        acceptor: TlsAcceptor,
+    ) -> UpgradeWebRTCServer<TlsUpgradeTransportServer<S>> {
+        UpgradeWebRTCServer {
+            server: TlsUpgradeTransportServer {
+                server: self.server,
+                acceptor,
+            },
+            api: self.api,
+            config: self.config,
+        }
+    }
+
+    pub fn add_tls_from_config(
+        self,
+        config: &TlsServerConfig,
+    ) -> Result<UpgradeWebRTCServer<TlsUpgradeTransportServer<S>>, (TlsInitError, Self)> {
+        let acceptor = match new_tls_acceptor(&config) {
+            Ok(x) => x,
+            Err(e) => return Err((e, self)),
+        };
+        Ok(self.add_tls(acceptor))
+    }
+}
+
+pub async fn server_new_tcp(
+    addr: impl ToSocketAddrs,
+) -> std::io::Result<UpgradeWebRTCServer<TcpListener>> {
     Ok(UpgradeWebRTCServer::new(TcpListener::bind(addr).await?))
+}
+
+#[cfg(feature = "local_sockets")]
+pub async fn server_new_local_socket<'a>(
+    addr: impl interprocess::local_socket::ToLocalSocketName<'a>,
+) -> std::io::Result<UpgradeWebRTCServer<interprocess::local_socket::tokio::LocalSocketListener>> {
+    use interprocess::local_socket::tokio::LocalSocketListener;
+
+    Ok(UpgradeWebRTCServer::new(LocalSocketListener::bind(addr)?))
 }

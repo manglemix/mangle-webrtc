@@ -2,6 +2,7 @@
 
 members = [
     "upgrade2webrtc",
+    "webrtc-tunnel"
 ]
 
 [workspace.dependencies]
@@ -9,6 +10,7 @@ webrtc = "0.9"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "macros", "sync", "signal", "parking_lot"] }
 serde = { version = "1", features = ["derive"] }
 bitcode = { version = "0.4", features = ["serde"] }
-futures = "0.3"
 interprocess = { version = "1.2.1", features = ["tokio_support"] }
 hex = "0.4.3"
+tokio-scoped = "0.2"
+async-trait = "0.1.73"

@@ -1,9 +1,29 @@
-use std::fmt::Debug;
+use std::{
+    fmt::{Debug, Display},
+    path::Path,
+};
 
-use tokio::{net::{ToSocketAddrs, TcpStream}, io::BufStream};
-use webrtc::{api::{API, media_engine::MediaEngine, interceptor_registry::register_default_interceptors, APIBuilder}, peer_connection::{configuration::RTCConfiguration, RTCPeerConnection}, interceptor::registry::Registry, ice_transport::{ice_server::RTCIceServer, ice_candidate::RTCIceCandidate}};
+use tokio::{
+    io::{AsyncRead, AsyncWrite, BufStream},
+    net::{TcpStream, ToSocketAddrs},
+};
+pub use tokio_rustls::rustls::ServerName;
+use tokio_rustls::{client::TlsStream, TlsConnector};
+use webrtc::{
+    api::{
+        interceptor_registry::register_default_interceptors, media_engine::MediaEngine, APIBuilder,
+        API,
+    },
+    ice_transport::{ice_candidate::RTCIceCandidate, ice_server::RTCIceServer},
+    interceptor::registry::Registry,
+    peer_connection::{configuration::RTCConfiguration, RTCPeerConnection},
+};
 
-use crate::{transport::{UpgradeTransport, StreamTransport, RecvError}, RTCMessage};
+use crate::{
+    tls::{new_tls_connector, TlsInitError},
+    transport::{IDUpgradeTransport, RecvError, StreamTransport, UpgradeTransport},
+    RTCMessage,
+};
 
 pub struct UpgradeWebRTCClient<C: UpgradeTransport> {
     client: C,
@@ -11,22 +31,21 @@ pub struct UpgradeWebRTCClient<C: UpgradeTransport> {
     config: RTCConfiguration,
 }
 
-
 impl<C: Debug + UpgradeTransport> Debug for UpgradeWebRTCClient<C> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("UpgradeWebRTCClient").field("client", &self.client).finish()
+        f.debug_struct("UpgradeWebRTCClient")
+            .field("client", &self.client)
+            .finish()
     }
 }
-
 
 #[derive(Debug)]
 pub enum ClientError<DE> {
     WebRTCError(webrtc::Error),
     IOError(std::io::Error),
     DeserializeError(DE),
-    UnexpectedMessage
+    UnexpectedMessage,
 }
-
 
 impl<DE> From<webrtc::Error> for ClientError<DE> {
     fn from(value: webrtc::Error) -> Self {
@@ -34,13 +53,11 @@ impl<DE> From<webrtc::Error> for ClientError<DE> {
     }
 }
 
-
 impl<DE> From<std::io::Error> for ClientError<DE> {
     fn from(value: std::io::Error) -> Self {
         ClientError::IOError(value)
     }
 }
-
 
 impl<DE> From<RecvError<DE>> for ClientError<DE> {
     fn from(value: RecvError<DE>) -> Self {
@@ -51,16 +68,30 @@ impl<DE> From<RecvError<DE>> for ClientError<DE> {
     }
 }
 
+impl<DE: Display> Display for ClientError<DE> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ClientError::WebRTCError(e) => write!(f, "{e}"),
+            ClientError::IOError(e) => write!(f, "{e}"),
+            ClientError::DeserializeError(e) => write!(f, "{e}"),
+            ClientError::UnexpectedMessage => write!(f, "Unexpected WebRTC SDP type"),
+        }
+    }
+}
+
+impl<DE: Display + Debug> std::error::Error for ClientError<DE> {}
 
 impl<C: UpgradeTransport> UpgradeWebRTCClient<C> {
     pub fn new(client: C) -> Self {
         let mut m = MediaEngine::default();
-        m.register_default_codecs().expect("Default codecs should have registered safely");
+        m.register_default_codecs()
+            .expect("Default codecs should have registered safely");
 
         let mut registry = Registry::new();
 
         // Use the default set of Interceptors
-        registry = register_default_interceptors(registry, &mut m).expect("Default interceptors should have registered safely");
+        registry = register_default_interceptors(registry, &mut m)
+            .expect("Default interceptors should have registered safely");
 
         Self {
             client,
@@ -74,14 +105,13 @@ impl<C: UpgradeTransport> UpgradeWebRTCClient<C> {
                     ..Default::default()
                 }],
                 ..Default::default()
-            }
+            },
         }
     }
 
     pub async fn upgrade(
         &mut self,
-    ) -> Result<RTCPeerConnection, ClientError<C::DeserializationError>>
-    {
+    ) -> Result<RTCPeerConnection, ClientError<C::DeserializationError>> {
         let peer = self.api.new_peer_connection(self.config.clone()).await?;
         let _data_channel = peer.create_data_channel("command", None).await?;
         let offer = peer.create_offer(None).await?;
@@ -92,7 +122,7 @@ impl<C: UpgradeTransport> UpgradeWebRTCClient<C> {
             let msg: RTCMessage = self.client.recv_obj().await?;
             match msg {
                 RTCMessage::SDPAnswer(x) => break x,
-                RTCMessage::ICE(x) => ices.push(x)
+                RTCMessage::ICE(x) => ices.push(x),
             }
         };
         peer.set_remote_description(answer).await?;
@@ -104,7 +134,9 @@ impl<C: UpgradeTransport> UpgradeWebRTCClient<C> {
 
         peer.on_ice_candidate(Box::new(move |c: Option<RTCIceCandidate>| {
             let ice_sender = ice_sender.clone();
-            Box::pin(async move { let _ = ice_sender.send(c).await; })
+            Box::pin(async move {
+                let _ = ice_sender.send(c).await;
+            })
         }));
 
         let mut done_sending_ice = false;
@@ -114,7 +146,6 @@ impl<C: UpgradeTransport> UpgradeWebRTCClient<C> {
             tokio::select! {
                 ice_to_send = ice_receiver.recv() => {
                     let ice_to_send = ice_to_send.unwrap();
-                    println!("c send {}", ice_to_send.is_some());
                     self.client.send_obj(&ice_to_send).await?;
                     if ice_to_send.is_none() {
                         done_sending_ice = true;
@@ -130,7 +161,6 @@ impl<C: UpgradeTransport> UpgradeWebRTCClient<C> {
                         None => None,
                         _ => return Err(ClientError::UnexpectedMessage)
                     };
-                    println!("c {}", received_ice.is_some());
                     let Some(received_ice) = received_ice else {
                         done_receiving_ice = true;
                         if done_sending_ice {
@@ -152,6 +182,62 @@ impl<C: UpgradeTransport> UpgradeWebRTCClient<C> {
     }
 }
 
-pub async fn client_new_tcp(addr: impl ToSocketAddrs) -> std::io::Result<UpgradeWebRTCClient<StreamTransport<BufStream<TcpStream>>>> {
-    Ok(UpgradeWebRTCClient::new(BufStream::new(TcpStream::connect(addr).await?).into()))
+// pub struct TlsUpgradeTransport<S: AsyncWrite + AsyncRead + Send + Unpin + 'static + IDUpgradeTransport> {
+//     stream: TlsSt<S>,
+//     acceptor: TlsConnector
+// }
+
+impl<C> UpgradeWebRTCClient<StreamTransport<C>>
+where
+    C: AsyncWrite + AsyncRead + Send + Sync + Unpin + 'static + IDUpgradeTransport,
+{
+    pub async fn add_tls(
+        self,
+        domain: ServerName,
+        connector: &TlsConnector,
+    ) -> std::io::Result<UpgradeWebRTCClient<StreamTransport<TlsStream<C>>>> {
+        let stream = connector.connect(domain, self.client.stream).await?;
+        Ok(UpgradeWebRTCClient {
+            client: StreamTransport::from(stream),
+            api: self.api,
+            config: self.config,
+        })
+    }
+
+    pub async fn add_tls_from_config(
+        self,
+        domain: ServerName,
+        root_cert_path: Option<impl AsRef<Path>>,
+    ) -> Result<UpgradeWebRTCClient<StreamTransport<TlsStream<C>>>, TlsInitError> {
+        let connector = new_tls_connector(root_cert_path)?;
+        self.add_tls(domain, &connector).await.map_err(Into::into)
+    }
+}
+
+pub async fn client_new_tcp(
+    addr: impl ToSocketAddrs,
+) -> std::io::Result<UpgradeWebRTCClient<StreamTransport<BufStream<TcpStream>>>> {
+    Ok(UpgradeWebRTCClient::new(
+        BufStream::new(TcpStream::connect(addr).await?).into(),
+    ))
+}
+
+#[cfg(feature = "local_sockets")]
+pub async fn client_new_local_socket<'a>(
+    addr: impl interprocess::local_socket::ToLocalSocketName<'a>,
+) -> std::io::Result<
+    UpgradeWebRTCClient<
+        StreamTransport<
+            BufStream<
+                tokio_util::compat::Compat<interprocess::local_socket::tokio::LocalSocketStream>,
+            >,
+        >,
+    >,
+> {
+    use interprocess::local_socket::tokio::LocalSocketStream;
+    use tokio_util::compat::FuturesAsyncWriteCompatExt;
+
+    Ok(UpgradeWebRTCClient::new(
+        BufStream::new(LocalSocketStream::connect(addr).await?.compat_write()).into(),
+    ))
 }

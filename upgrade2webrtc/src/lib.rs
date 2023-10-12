@@ -1,32 +1,44 @@
-#![feature(async_fn_in_trait)]
+#![feature(ptr_from_ref)]
 
-use serde::{Serialize, Deserialize};
-use webrtc::{peer_connection::sdp::session_description::RTCSessionDescription, ice_transport::ice_candidate::RTCIceCandidateInit};
+use serde::{Deserialize, Serialize};
+use webrtc::{
+    ice_transport::ice_candidate::RTCIceCandidateInit,
+    peer_connection::sdp::session_description::RTCSessionDescription,
+};
 
-pub mod server;
-pub mod transport;
 pub mod client;
-
+pub mod server;
+pub mod tls;
+pub mod transport;
 
 #[derive(Serialize, Deserialize)]
 enum RTCMessage {
     SDPAnswer(RTCSessionDescription),
-    ICE(RTCIceCandidateInit)
+    ICE(RTCIceCandidateInit),
 }
-
 
 #[cfg(test)]
 mod tests {
     use tokio::sync::mpsc;
 
-    use crate::{server::server_new_tcp, client::client_new_tcp};
+    use crate::{client::client_new_tcp, server::server_new_tcp};
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn general_test01() {
-        let mut server = server_new_tcp("127.0.0.1:8000").await.expect("Server should have initialized");
+    async fn local_tcp_test_01() {
+        let mut server = server_new_tcp("127.0.0.1:8000")
+            .await
+            .expect("Server should have initialized");
         let (server_sender, mut server_recv) = mpsc::channel(1);
+        let server_sender: &_ = Box::leak(Box::new(server_sender));
         let handle = tokio::spawn(async move {
-            server.run::<(), _, _>(|p| async { server_sender.send(p).await.unwrap(); }, |e| async move { panic!("Server Error: {e:?}") }).await;
+            server
+                .run::<_, _>(
+                    move |p, _| async move {
+                        server_sender.send(p).await.unwrap();
+                    },
+                    |e, _| async move { panic!("Server Error: {e:?}") },
+                )
+                .await;
         });
         macro_rules! expect {
             ($result: expr, $msg: expr) => {{
@@ -37,8 +49,11 @@ mod tests {
                 result.expect($msg)
             }};
         }
-        
-        let mut client = expect!(client_new_tcp("127.0.0.1:8000").await, "Client should have initialized");
+
+        let mut client = expect!(
+            client_new_tcp("127.0.0.1:8000").await,
+            "Client should have initialized"
+        );
         expect!(client.upgrade().await, "Client should have upgraded");
         if server_recv.recv().await.is_none() {
             handle.abort();

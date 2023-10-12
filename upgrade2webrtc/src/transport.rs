@@ -1,14 +1,22 @@
 use std::fmt::Debug;
 
+use async_trait::async_trait;
 use serde::{de::DeserializeOwned, Serialize};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufStream};
+#[cfg(feature = "local_sockets")]
+use tokio_util::compat::{Compat, FuturesAsyncWriteCompatExt};
 
-pub trait UpgradeTransport: Send + 'static {
-    type DeserializationError: std::error::Error;
+#[cfg(feature = "local_sockets")]
+use interprocess::local_socket::tokio::{LocalSocketListener, LocalSocketStream};
+
+#[async_trait]
+pub trait UpgradeTransport: Send + Sync + 'static {
+    type DeserializationError: std::error::Error + Send;
 
     /// # Cancel Safety
     /// This method is not cancel safe according to the `tokio` guidelines
-    async fn send_obj(&mut self, obj: &impl Serialize) -> std::io::Result<()>;
+    async fn send_obj(&mut self, obj: &(impl Serialize + Sync)) -> std::io::Result<()>;
+
     /// # Cancel Safety
     /// This method *is* cancel safe according to the `tokio` guidelines
     async fn recv_obj<T: DeserializeOwned>(
@@ -22,21 +30,38 @@ pub trait IDUpgradeTransport {
     fn get_id(&self) -> String;
 }
 
-pub trait UpgradeTransportServer {
-    type AcceptError: std::error::Error;
+#[async_trait]
+pub trait UpgradeTransportServer: Send {
+    type AcceptError: std::error::Error + Send;
     type UpgradeTransport: UpgradeTransport + IDUpgradeTransport;
 
     async fn accept(&mut self) -> Result<Self::UpgradeTransport, Self::AcceptError>;
 }
 
-
+#[async_trait]
 impl UpgradeTransportServer for tokio::net::TcpListener {
     type AcceptError = std::io::Error;
 
-    type UpgradeTransport = StreamTransport<tokio::io::BufStream<tokio::net::TcpStream>>;
+    type UpgradeTransport = StreamTransport<BufStream<tokio::net::TcpStream>>;
 
     async fn accept(&mut self) -> Result<Self::UpgradeTransport, Self::AcceptError> {
-        tokio::net::TcpListener::accept(self).await.map(|x| tokio::io::BufStream::new(x.0).into())
+        tokio::net::TcpListener::accept(self)
+            .await
+            .map(|x| BufStream::new(x.0).into())
+    }
+}
+
+#[async_trait]
+#[cfg(feature = "local_sockets")]
+impl UpgradeTransportServer for LocalSocketListener {
+    type AcceptError = std::io::Error;
+
+    type UpgradeTransport = StreamTransport<BufStream<Compat<LocalSocketStream>>>;
+
+    async fn accept(&mut self) -> Result<Self::UpgradeTransport, Self::AcceptError> {
+        LocalSocketListener::accept(self)
+            .await
+            .map(|x| (BufStream::new(x.compat_write())).into())
     }
 }
 
@@ -46,24 +71,18 @@ impl UpgradeTransportServer for tokio::net::TcpListener {
 /// This relies on the stream being *reliable* but not necessarily ordered.
 /// Unreliable protocols such as UDP must be wrapped in a struct that makes it reliable.
 pub struct StreamTransport<T: AsyncWrite + AsyncRead + Send + Unpin + 'static> {
-    stream: T,
+    pub(crate) stream: T,
     recv_buffer: Vec<u8>,
 }
 
-
 impl<T: AsyncWrite + AsyncRead + Send + Unpin + Debug + 'static> Debug for StreamTransport<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("StreamTransport").field("stream", &self.stream).field("recv_buffer", &hex::encode(&self.recv_buffer)).finish()
+        f.debug_struct("StreamTransport")
+            .field("stream", &self.stream)
+            .field("recv_buffer", &hex::encode(&self.recv_buffer))
+            .finish()
     }
 }
-
-
-// impl<T: AsyncWrite + AsyncRead + Send + Unpin + 'static> Drop for StreamTransport<T> {
-//     fn drop(&mut self) {
-//         unreachable!()
-//     }
-// }
-
 
 impl<T: AsyncWrite + AsyncRead + Send + Unpin + 'static> From<T> for StreamTransport<T> {
     fn from(stream: T) -> Self {
@@ -80,20 +99,18 @@ pub enum RecvError<E> {
     IOError(std::io::Error),
 }
 
-
-impl<T: AsyncWrite + AsyncRead + Send + Unpin + 'static> UpgradeTransport for StreamTransport<T> {
-    // type DeserializationError = serde_json::Error;
+#[async_trait]
+impl<T: AsyncWrite + AsyncRead + Send + Sync + Unpin + 'static> UpgradeTransport
+    for StreamTransport<T>
+{
     type DeserializationError = bitcode::Error;
 
-    async fn send_obj(&mut self, obj: &impl Serialize) -> std::io::Result<()> {
-        // let msg = serde_json::to_vec_pretty(obj).expect("The given object should be serializable");
-        // println!("{}", String::from_utf8(msg.clone()).unwrap());
+    async fn send_obj(&mut self, obj: &(impl Serialize + Sync)) -> std::io::Result<()> {
         let msg = bitcode::serialize(obj).expect("The given object should be serializable");
         let size: u32 = msg
             .len()
             .try_into()
             .expect("Length of serialized bytes of the given object should be less than u32::MAX");
-        println!("{size}");
         self.stream.write_all(&size.to_le_bytes()).await?;
         self.stream.write_all(&msg).await?;
         self.stream.flush().await
@@ -102,9 +119,19 @@ impl<T: AsyncWrite + AsyncRead + Send + Unpin + 'static> UpgradeTransport for St
     async fn recv_obj<V: DeserializeOwned>(
         &mut self,
     ) -> Result<V, RecvError<Self::DeserializationError>> {
+        if self.recv_buffer.len() >= 4 {
+            let size: [u8; 4] = self.recv_buffer.split_at(4).0.try_into().unwrap();
+            let size = u32::from_le_bytes(size) as usize + 4;
+            if self.recv_buffer.len() >= size {
+                let buf = self.recv_buffer.split_at(size).0.split_at(4).1;
+                let result = bitcode::deserialize(buf).map_err(RecvError::DeserializeError);
+                self.recv_buffer.drain(0..size);
+                return result
+            }
+        }
+
         let mut buf = [0u8; 1024];
         loop {
-            // println!("{}", self.recv_buffer.len());
             let n = self
                 .stream
                 .read(&mut buf)
@@ -112,7 +139,9 @@ impl<T: AsyncWrite + AsyncRead + Send + Unpin + 'static> UpgradeTransport for St
                 .map_err(RecvError::IOError)?;
             if n == 0 {
                 // continue
-                return Err(RecvError::IOError(std::io::Error::from(std::io::ErrorKind::UnexpectedEof)))
+                return Err(RecvError::IOError(std::io::Error::from(
+                    std::io::ErrorKind::UnexpectedEof,
+                )));
             }
             self.recv_buffer.extend_from_slice(buf.split_at(n).0);
             if self.recv_buffer.len() < 4 {
@@ -123,15 +152,9 @@ impl<T: AsyncWrite + AsyncRead + Send + Unpin + 'static> UpgradeTransport for St
             if self.recv_buffer.len() < size {
                 continue;
             }
-            // println!("r {:?}", self.recv_buffer.split_at(size).0.split_at(4).1.split_at(50).0);
             let buf = self.recv_buffer.split_at(size).0.split_at(4).1;
-            // println!("{}", String::from_utf8(buf.to_vec()).unwrap());
-            // let result = serde_json::from_slice(buf).map_err(RecvError::DeserializeError);
             let result = bitcode::deserialize(buf).map_err(RecvError::DeserializeError);
-            #[cfg(debug_assertions)]
-            let len = self.recv_buffer.len();
             self.recv_buffer.drain(0..size);
-            debug_assert_eq!(len - size, self.recv_buffer.len());
             break result;
         }
     }
@@ -141,27 +164,64 @@ impl<T: AsyncWrite + AsyncRead + Send + Unpin + 'static> UpgradeTransport for St
     }
 }
 
-impl IDUpgradeTransport for StreamTransport<tokio::net::TcpStream> {
+impl<S: IDUpgradeTransport + AsyncWrite + AsyncRead + Send + Unpin + 'static> IDUpgradeTransport
+    for StreamTransport<S>
+{
     fn get_id(&self) -> String {
-        self.stream
-            .peer_addr()
+        self.stream.get_id()
+    }
+}
+
+impl IDUpgradeTransport for tokio::net::TcpStream {
+    fn get_id(&self) -> String {
+        self.peer_addr()
             .map(|x| x.to_string())
             .unwrap_or_else(|e| format!("GET_ID_ERROR: {e}"))
     }
 }
 
-impl IDUpgradeTransport for StreamTransport<tokio::io::BufStream<tokio::net::TcpStream>> {
+impl<S: IDUpgradeTransport> IDUpgradeTransport for tokio_rustls::TlsStream<S> {
     fn get_id(&self) -> String {
-        self.stream
-            .get_ref()
-            .peer_addr()
-            .map(|x| x.to_string())
-            .unwrap_or_else(|e| format!("GET_ID_ERROR: {e}"))
+        self.get_ref().0.get_id()
     }
 }
 
-impl IDUpgradeTransport for StreamTransport<tokio::io::DuplexStream> {
+impl<S: IDUpgradeTransport> IDUpgradeTransport for tokio_rustls::client::TlsStream<S> {
+    fn get_id(&self) -> String {
+        self.get_ref().0.get_id()
+    }
+}
+
+impl<S: IDUpgradeTransport> IDUpgradeTransport for tokio_rustls::server::TlsStream<S> {
+    fn get_id(&self) -> String {
+        self.get_ref().0.get_id()
+    }
+}
+
+#[cfg(feature = "local_sockets")]
+impl<S: IDUpgradeTransport> IDUpgradeTransport for Compat<S> {
+    fn get_id(&self) -> String {
+        self.get_ref().get_id()
+    }
+}
+
+impl<S: IDUpgradeTransport + AsyncRead + AsyncWrite> IDUpgradeTransport for BufStream<S> {
+    fn get_id(&self) -> String {
+        self.get_ref().get_id()
+    }
+}
+
+impl IDUpgradeTransport for tokio::io::DuplexStream {
     fn get_id(&self) -> String {
         format!("{:p}", self)
+    }
+}
+
+#[cfg(feature = "local_sockets")]
+impl IDUpgradeTransport for LocalSocketStream {
+    fn get_id(&self) -> String {
+        self.peer_pid()
+            .map(|x| format!("PID({x})"))
+            .unwrap_or_else(|e| format!("GET_ID_ERROR: {e}"))
     }
 }
