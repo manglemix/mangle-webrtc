@@ -51,5 +51,7 @@ jobs:
       if: startsWith(github.ref, 'refs/tags/')
       with:
         files: |
-          target/x86_64-pc-windows-gnu/debug/webrtc-tunnel.exe
-          target/debug/webrtc-tunnel
+          target/x86_64-pc-windows-gnu/debug/webrtc-tunnel-client.exe
+          target/debug/webrtc-tunnel-client
+          target/x86_64-pc-windows-gnu/debug/webrtc-tunnel-server.exe
+          target/debug/webrtc-tunnel-server
