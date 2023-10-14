@@ -28,7 +28,7 @@ jobs:
     - name: Build Mac Intel
       uses: Shogan/rust-musl-action@v1.0.2
       with:
-        args: cargo +nightly build --target x86_64-apple-darwin
+        args: rustup install nightly && cargo +nightly build --target x86_64-apple-darwin
     
     - name: Debug
       run: ls target/x86_64-apple-darwin/debug
