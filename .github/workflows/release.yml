@@ -17,10 +17,24 @@ jobs:
         tool: cross
     
     - name: Build Linux
+      run: cargo build -p webrtc-tunnel --features server
+    
+    - name: Build Windows
+      run: cross build --target x86_64-pc-windows-gnu -p webrtc-tunnel --features server
+
+    - name: Rename client
+      run: mv target/x86_64-pc-windows-gnu/debug/webrtc-tunnel.exe target/x86_64-pc-windows-gnu/debug/webrtc-tunnel-server.exe && \
+        mv target/debug/webrtc-tunnel target/debug/webrtc-tunnel-server
+    
+    - name: Build Linux
       run: cargo build -p webrtc-tunnel
     
     - name: Build Windows
       run: cross build --target x86_64-pc-windows-gnu -p webrtc-tunnel
+
+    - name: Rename server
+      run: mv target/x86_64-pc-windows-gnu/debug/webrtc-tunnel.exe target/x86_64-pc-windows-gnu/debug/webrtc-tunnel-client.exe && \
+        mv target/debug/webrtc-tunnel target/debug/webrtc-tunnel-client
     
     # - name: Build Mac Intel
     #   uses: Shogan/rust-musl-action@v1.0.2
