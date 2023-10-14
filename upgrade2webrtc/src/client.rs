@@ -1,6 +1,7 @@
 use std::{
     fmt::{Debug, Display},
     path::Path,
+    sync::Arc,
 };
 
 use tokio::{
@@ -14,6 +15,7 @@ use webrtc::{
         interceptor_registry::register_default_interceptors, media_engine::MediaEngine, APIBuilder,
         API,
     },
+    data_channel::{data_channel_init::RTCDataChannelInit, RTCDataChannel},
     ice_transport::{ice_candidate::RTCIceCandidate, ice_server::RTCIceServer},
     interceptor::registry::Registry,
     peer_connection::{configuration::RTCConfiguration, RTCPeerConnection},
@@ -37,6 +39,11 @@ impl<C: Debug + UpgradeTransport> Debug for UpgradeWebRTCClient<C> {
             .field("client", &self.client)
             .finish()
     }
+}
+
+pub struct PeerAndChannels<'a> {
+    pub peer: RTCPeerConnection,
+    pub channels: Vec<(&'a str, Arc<RTCDataChannel>)>,
 }
 
 #[derive(Debug)]
@@ -109,11 +116,17 @@ impl<C: UpgradeTransport> UpgradeWebRTCClient<C> {
         }
     }
 
-    pub async fn upgrade(
+    pub async fn upgrade<'a>(
         &mut self,
-    ) -> Result<RTCPeerConnection, ClientError<C::DeserializationError>> {
+        channel_configs: impl IntoIterator<Item = (&'a str, RTCDataChannelInit)>,
+    ) -> Result<PeerAndChannels<'a>, ClientError<C::DeserializationError>> {
         let peer = self.api.new_peer_connection(self.config.clone()).await?;
-        let _data_channel = peer.create_data_channel("command", None).await?;
+        let mut channels = vec![];
+
+        for (label, option) in channel_configs {
+            channels.push((label, peer.create_data_channel(label, Some(option)).await?));
+        }
+
         let offer = peer.create_offer(None).await?;
         self.client.send_obj(&offer).await?;
         peer.set_local_description(offer).await?;
@@ -173,19 +186,9 @@ impl<C: UpgradeTransport> UpgradeWebRTCClient<C> {
             }
         }
 
-        // if let Err(e) = self.client.flush().await {
-        //     let _ = peer.close().await;
-        //     return Err(ClientError::IOError(e))
-        // }
-
-        Ok(peer)
+        Ok(PeerAndChannels { peer, channels })
     }
 }
-
-// pub struct TlsUpgradeTransport<S: AsyncWrite + AsyncRead + Send + Unpin + 'static + IDUpgradeTransport> {
-//     stream: TlsSt<S>,
-//     acceptor: TlsConnector
-// }
 
 impl<C> UpgradeWebRTCClient<StreamTransport<C>>
 where

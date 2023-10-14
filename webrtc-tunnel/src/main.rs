@@ -1,26 +1,102 @@
-use std::time::SystemTime;
-
-use anyhow::anyhow;
-use clap::{Parser, Subcommand};
-use serde::Deserialize;
-use upgrade2webrtc::{
-    client::{client_new_local_socket, client_new_tcp, ServerName},
-    server::{server_new_local_socket, server_new_tcp},
-    tls::TlsServerConfig,
+#![feature(slice_as_chunks)]
+use std::{
+    net::{Ipv4Addr, SocketAddrV4},
+    num::NonZeroU16,
+    sync::{Arc, atomic::AtomicUsize},
+    time::SystemTime, ops::{DerefMut, Deref}, collections::hash_map::Entry,
+    sync::atomic::Ordering
 };
 
-#[derive(Deserialize, Default)]
+use anyhow::anyhow;
+use bytes::Bytes;
+use clap::{Parser, Subcommand};
+use fxhash::FxHashMap;
+use serde::Deserialize;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt, BufStream},
+    net::{TcpStream, UdpSocket},
+    sync::mpsc, task::JoinSet,
+};
+use upgrade2webrtc::{
+    client::{client_new_local_socket, client_new_tcp, PeerAndChannels, ServerName},
+    server::{server_new_local_socket, server_new_tcp},
+    tls::TlsServerConfig,
+    webrtc::{data_channel::{data_channel_init::RTCDataChannelInit, RTCDataChannel}, peer_connection::RTCPeerConnection},
+    RELIABLE_UNORDERED_DATA_CHANNEL, TCP_DATA_CHANNEL, UDP_DATA_CHANNEL,
+};
+
+const UDP_PACKET_SIZE: usize = 512;
+
+#[derive(Deserialize, Clone, Copy)]
+enum Quality {
+    UDP,
+    TCP,
+    ReliableUnordered,
+}
+
+impl Into<RTCDataChannelInit> for Quality {
+    fn into(self) -> RTCDataChannelInit {
+        match self {
+            Quality::UDP => UDP_DATA_CHANNEL,
+            Quality::TCP => TCP_DATA_CHANNEL,
+            Quality::ReliableUnordered => RELIABLE_UNORDERED_DATA_CHANNEL,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+enum Channel {
+    UDP { port: NonZeroU16, quality: Option<Quality> },
+    TCP { port: NonZeroU16, quality: Option<Quality> },
+    LocalSocket { addr: String, quality: Option<Quality> },
+}
+
+// impl Into<(String, RTCDataChannelInit)> for Channel {
+//     fn into(self) -> (String, RTCDataChannelInit) {
+//         let mut out: (String, RTCDataChannelInit) = match self {
+//             Channel::UDP { port, quality } => (port.to_string(), quality.expect(&format!("Missing quality setting for port {port}")).into()),
+//             Channel::TCP { port, quality } => (port.to_string(), quality.expect(&format!("Missing quality setting for port {port}")).into()),
+//             Channel::LocalSocket { addr, quality } => {
+//                 // Address must not be a port
+//                 assert!(addr.parse::<u16>().is_err());
+//                 (addr.clone(), quality.expect(&format!("Missing quality setting for local socket {addr}")).into())
+//             }
+//         };
+//         out.1.protocol = Some(out.0.clone());
+//         out
+//     }
+// }
+
+#[derive(Deserialize)]
+pub struct ServerConfig {
+    /// The path to the root certificate.
+    #[serde(default)]
+    pub root_cert_chain_path: String,
+    /// The path to the root private key.
+    #[serde(default)]
+    pub parent_key_path: String,
+    /// Subject Alternative Names that will be used to create
+    /// the server certificate.
+    #[serde(default)]
+    pub subject_alt_names: Vec<String>,
+    #[serde(default)]
+    pub create_if_missing: bool,
+    channels: Vec<Channel>,
+}
+
+#[derive(Deserialize)]
 struct ClientConfig {
     #[serde(default)]
     use_tls: bool,
     root_cert_path: Option<String>,
     domain_name: Option<String>,
+    channels: Vec<Channel>,
 }
 
 #[derive(Subcommand, Debug)]
 enum ClientStreamType {
     TCP { addr: String },
-    LocalSocket { domain: String, addr: String },
+    LocalSocket { addr: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -36,7 +112,7 @@ enum Command {
     Client {
         #[command(subcommand)]
         stream_type: ClientStreamType,
-        config_path: Option<String>,
+        config_path: String,
     },
 
     /// Doc comment
@@ -44,7 +120,7 @@ enum Command {
     Server {
         #[command(subcommand)]
         stream_type: ServerStreamType,
-        config_path: Option<String>,
+        config_path: String,
     },
 }
 
@@ -80,86 +156,308 @@ async fn main() -> anyhow::Result<()> {
             stream_type,
             config_path,
         } => {
-            let config: ClientConfig = if let Some(config_path) = config_path {
-                toml::from_str(std::fs::read_to_string(config_path)?.as_str())?
-            } else {
-                Default::default()
-            };
+            let config: ClientConfig =
+                toml::from_str(std::fs::read_to_string(config_path)?.as_str())?;
 
-            match stream_type {
+            // let channels: Vec<_> = config
+            //     .channels
+            //     .into_iter()
+            //     .map(|x| Into::<(String, RTCDataChannelInit)>::into(x))
+            //     .collect();
+
+            // let channels = channels.iter().map(|x| (x.0.as_str(), x.1.clone()));
+            let init_channels = [("init", TCP_DATA_CHANNEL)];
+
+            let PeerAndChannels { peer, mut channels } = match stream_type {
                 ClientStreamType::TCP { addr } => {
-                    let domain = ServerName::try_from(
-                        config
-                            .domain_name
-                            .as_ref()
-                            .ok_or(anyhow!("Missing domain name"))?
-                            .as_str(),
-                    )?;
                     let mut client = client_new_tcp(addr).await?;
-                    let peer = if config.use_tls {
+                    if config.use_tls {
+                        let domain = ServerName::try_from(
+                            config
+                                .domain_name
+                                .as_ref()
+                                .ok_or(anyhow!("Missing domain name"))?
+                                .as_str(),
+                        )?;
                         let mut client = client
                             .add_tls_from_config(domain, config.root_cert_path)
                             .await?;
-                        client.upgrade().await?
+                        client.upgrade(init_channels).await?
                     } else {
-                        client.upgrade().await?
-                    };
-                    println!("Success")
+                        client.upgrade(init_channels).await?
+                    }
                 }
-                ClientStreamType::LocalSocket { domain, addr } => {
-                    let domain = ServerName::try_from(domain.as_str())?;
+                ClientStreamType::LocalSocket { addr } => {
                     let mut client = client_new_local_socket(addr).await?;
-                    let peer = if config.use_tls {
+                    if config.use_tls {
+                        let domain = ServerName::try_from(
+                            config
+                                .domain_name
+                                .as_ref()
+                                .ok_or(anyhow!("Missing domain name"))?
+                                .as_str(),
+                        )?;
                         let mut client = client
                             .add_tls_from_config(domain, config.root_cert_path)
                             .await?;
-                        client.upgrade().await?
+                        client.upgrade(init_channels).await?
                     } else {
-                        client.upgrade().await?
-                    };
-                    println!("Success")
+                        client.upgrade(init_channels).await?
+                    }
+                }
+            };
+            let init_channel = channels.pop().unwrap();
+            init_channel.1.close().await?;
+
+            struct PeerWrapper(Option<RTCPeerConnection>);
+
+            impl Deref for PeerWrapper {
+                type Target = RTCPeerConnection;
+
+                fn deref(&self) -> &Self::Target {
+                    self.0.as_ref().unwrap()
                 }
             }
+
+            impl DerefMut for PeerWrapper {
+                fn deref_mut(&mut self) -> &mut Self::Target {
+                    self.0.as_mut().unwrap()
+                }
+            }
+            
+            impl Drop for PeerWrapper {
+                fn drop(&mut self) {
+                    let peer = self.0.take().unwrap();
+                    tokio::spawn(async move {
+                        let _ = peer.close().await;
+                    });
+                }
+            }
+
+            let peer = Arc::new(PeerWrapper(Some(peer)));
+            let channel_counter = Arc::new(AtomicUsize::new(0));
+            let mut tasks = JoinSet::new();
+
+            for channel in config.channels {
+                let peer = peer.clone();
+                let channel_counter = channel_counter.clone();
+                tasks.spawn(async move {
+                    match channel {
+                        Channel::UDP { port, quality } => {
+                            let quality = quality.expect(&format!("Missing quality setting for port {port}"));
+                            let listener = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port.get())).await?;
+                            let mut buf = vec![0u8; UDP_PACKET_SIZE];
+                            let mut existing_channel_senders = FxHashMap::default();
+    
+                            tokio::select! {
+                                result = listener.recv_buf_from(&mut buf) => {
+                                    let (n, addr) = result?;
+                                    let buf = buf.as_slice().split_at(n).0;
+                                    
+                                    match existing_channel_senders.entry(addr) {
+                                        Entry::Occupied(_) => todo!(),
+                                        Entry::Vacant(x) => {
+                                            let (sender, receiver) = mpsc::channel(3);
+    
+                                            let channel_idx = channel_counter.fetch_add(1, Ordering::Relaxed);
+                                            peer.create_data_channel(&channel_idx.to_string(), Some(quality.into())).await?;
+    
+                                            tokio::spawn(async move {
+    
+                                            });
+    
+                                            x.insert(sender);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Channel::TCP { port, quality } => todo!(),
+                        Channel::LocalSocket { addr, quality } => todo!(),
+                    }
+                    Ok(())
+                });
+            }
+
+            let _ = peer.close().await;
         }
+
         #[cfg(feature = "server")]
         Command::Server {
             stream_type,
             config_path,
         } => {
-            let config: Option<TlsServerConfig> = if let Some(config_path) = config_path {
-                Some(toml::from_str(
-                    std::fs::read_to_string(config_path)?.as_str(),
-                )?)
-            } else {
-                None
+            let config: ServerConfig =
+                toml::from_str(std::fs::read_to_string(config_path)?.as_str())?;
+
+            let mut channels = FxHashMap::default();
+            for channel in config.channels {
+                match &channel {
+                    Channel::UDP { port, .. } => channels.insert(port.to_string(), channel),
+                    Channel::TCP { port, .. } => channels.insert(port.to_string(), channel),
+                    Channel::LocalSocket { addr, .. } => channels.insert(addr.clone(), channel),
+                };
+            }
+            let channels: &_ = Box::leak(Box::new(channels));
+
+            let on_success = move |_peer,
+                                   mut channels_recv: mpsc::Receiver<Arc<RTCDataChannel>>,
+                                   _| async move {
+                loop {
+                    let Some(data_channel) = channels_recv.recv().await else {
+                        break;
+                    };
+                    let Some(channel) = channels.get(data_channel.protocol()) else {
+                        let _ = data_channel.close().await;
+                        continue;
+                    };
+                    match channel {
+                        Channel::UDP { port, .. } => {
+                            let socket = match UdpSocket::bind("127.0.0.1:0").await {
+                                Ok(x) => x,
+                                Err(e) => {
+                                    panic!("{e}");
+                                }
+                            };
+                            if let Err(e) = socket
+                                .connect(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port.get()))
+                                .await
+                            {
+                                panic!("{e}");
+                            }
+                            let (bytes_sender, mut bytes_recv) = mpsc::channel(2);
+                            let bytes_sender = Arc::new(bytes_sender);
+
+                            data_channel.on_message(Box::new(move |msg| {
+                                let bytes_sender = bytes_sender.clone();
+                                Box::pin(async move {
+                                    let _ = bytes_sender.send(msg.data).await;
+                                })
+                            }));
+
+                            let mut buf = [0u8; UDP_PACKET_SIZE];
+                            tokio::select! {
+                                result = socket.recv(&mut buf) => {
+                                    let n = match result {
+                                        Ok(x) => x,
+                                        Err(e) => {
+                                            panic!("{e}");
+                                        }
+                                    };
+                                    let buf = Bytes::from(buf.split_at(n).0.to_vec());
+                                    match data_channel.send(&buf).await {
+                                        Ok(x) => debug_assert_eq!(x, n),
+                                        Err(e) => {
+                                            panic!("{e}");
+                                        }
+                                    }
+                                }
+                                msg = bytes_recv.recv() => {
+                                    let Some(msg) = msg else {
+                                        panic!()
+                                    };
+                                    let mut sent_n = 0usize;
+                                    while sent_n < msg.len() {
+                                        sent_n += match socket.send(msg.split_at(sent_n).1).await {
+                                            Ok(x) => x,
+                                            Err(e) => {
+                                                panic!("{e}");
+                                            }
+                                        };
+                                    }
+                                }
+                            }
+                        }
+                        Channel::TCP { port, .. } => {
+                            let socket = match TcpStream::connect(SocketAddrV4::new(
+                                Ipv4Addr::LOCALHOST,
+                                port.get(),
+                            ))
+                            .await
+                            {
+                                Ok(x) => x,
+                                Err(e) => {
+                                    panic!("{e}");
+                                }
+                            };
+                            let mut socket = BufStream::new(socket);
+                            let (bytes_sender, mut bytes_recv) = mpsc::channel(2);
+                            let bytes_sender = Arc::new(bytes_sender);
+
+                            data_channel.on_message(Box::new(move |msg| {
+                                let bytes_sender = bytes_sender.clone();
+                                Box::pin(async move {
+                                    let _ = bytes_sender.send(msg.data).await;
+                                })
+                            }));
+
+                            let mut buf = [0u8; 2048];
+                            tokio::select! {
+                                result = socket.read(&mut buf) => {
+                                    let n = match result {
+                                        Ok(x) => x,
+                                        Err(e) => {
+                                            panic!("{e}");
+                                        }
+                                    };
+                                    let buf = Bytes::from(buf.split_at(n).0.to_vec());
+                                    match data_channel.send(&buf).await {
+                                        Ok(x) => debug_assert_eq!(x, n),
+                                        Err(e) => {
+                                            panic!("{e}");
+                                        }
+                                    }
+                                }
+                                msg = bytes_recv.recv() => {
+                                    let Some(msg) = msg else {
+                                        panic!()
+                                    };
+                                    if let Err(e) = socket.write_all(&msg).await {
+                                        panic!("{e}");
+                                    }
+                                    if let Err(e) = socket.flush().await {
+                                        panic!("{e}");
+                                    }
+                                }
+                            }
+                        }
+                        Channel::LocalSocket { addr, .. } => {}
+                    }
+                }
+            };
+
+            macro_rules! on_err {
+                () => {
+                    |err, _| async move { panic!("{err}") }
+                };
+            }
+            let tls_config = TlsServerConfig {
+                root_cert_chain_path: config.root_cert_chain_path,
+                parent_key_path: config.parent_key_path,
+                subject_alt_names: config.subject_alt_names,
+                create_if_missing: config.create_if_missing,
             };
 
             match stream_type {
                 ServerStreamType::TCP { addr } => {
                     let mut server = server_new_tcp(addr).await?;
-                    if let Some(config) = config {
-                        let mut server = server.add_tls_from_config(&config).map_err(|e| e.0)?;
-                        server
-                            .run(|peer, _| async { println!("Success") }, |e, _| async {})
-                            .await
+                    if tls_config.root_cert_chain_path.is_empty() {
+                        server.run(on_success, on_err!()).await
                     } else {
-                        server
-                            .run(|peer, _| async { println!("Success") }, |e, _| async {})
-                            .await
-                    };
+                        let mut server =
+                            server.add_tls_from_config(&tls_config).map_err(|e| e.0)?;
+                        server.run(on_success, on_err!()).await
+                    }
                 }
                 ServerStreamType::LocalSocket { addr } => {
                     let mut server = server_new_local_socket(addr).await?;
-                    if let Some(config) = config {
-                        let mut server = server.add_tls_from_config(&config).map_err(|e| e.0)?;
-                        server
-                            .run(|peer, _| async { println!("Success") }, |e, _| async {})
-                            .await
+                    if tls_config.root_cert_chain_path.is_empty() {
+                        server.run(on_success, on_err!()).await
                     } else {
-                        server
-                            .run(|peer, _| async { println!("Success") }, |e, _| async {})
-                            .await
-                    };
+                        let mut server =
+                            server.add_tls_from_config(&tls_config).map_err(|e| e.0)?;
+                        server.run(on_success, on_err!()).await
+                    }
                 }
             }
         }

@@ -1,3 +1,6 @@
 use_tls = true
 root_cert_path = "root_cert.pem"
 domain_name = "rrr"
+channels = [
+    {"UDP" = { "port" = 64632, "quality" = "UDP" }}
+]

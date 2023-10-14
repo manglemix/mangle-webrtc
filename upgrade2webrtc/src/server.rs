@@ -12,6 +12,7 @@ use webrtc::{
         interceptor_registry::register_default_interceptors, media_engine::MediaEngine, APIBuilder,
         API,
     },
+    data_channel::RTCDataChannel,
     ice_transport::{ice_candidate::RTCIceCandidate, ice_server::RTCIceServer},
     interceptor::registry::Registry,
     peer_connection::{
@@ -50,6 +51,17 @@ pub enum ServerError<AE, DE> {
     WebRTCError(webrtc::Error),
 }
 
+impl<AE: Display, DE: Display> Display for ServerError<AE, DE> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ServerError::AcceptError(e) => write!(f, "{e}"),
+            ServerError::BadMessage { error, client_id } => write!(f, "From: {client_id}\n{error}"),
+            ServerError::IOError(e) => write!(f, "{e}"),
+            ServerError::WebRTCError(e) => write!(f, "{e}"),
+        }
+    }
+}
+
 impl<S: UpgradeTransportServer> UpgradeWebRTCServer<S> {
     pub fn new(server: S) -> Self {
         let mut m = MediaEngine::default();
@@ -82,7 +94,10 @@ impl<S: UpgradeTransportServer> UpgradeWebRTCServer<S> {
 
     pub async fn run<F1, F2>(
         &mut self,
-        on_success: impl Fn(RTCPeerConnection, ServerHandle) -> F1 + Send + Sync + 'static,
+        on_success: impl Fn(RTCPeerConnection, mpsc::Receiver<Arc<RTCDataChannel>>, ServerHandle) -> F1
+            + Send
+            + Sync
+            + 'static,
         on_err: impl Fn(
                 ServerError<
                     S::AcceptError,
@@ -156,7 +171,14 @@ impl<S: UpgradeTransportServer> UpgradeWebRTCServer<S> {
                                     }
                                 };
                             }
-                            let _data_channel = webrtc_unwrap!(peer.create_data_channel("command", None).await);
+
+                            let (channel_sender, channel_recv) = mpsc::channel(1);
+                            let channel_sender = Arc::new(channel_sender);
+
+                            peer.on_data_channel(Box::new(move |data_channel| {
+                                let channel_sender = channel_sender.clone();
+                                Box::pin(async move { let _ = channel_sender.send(data_channel).await; })
+                            }));
 
                             let (ice_sender, mut ice_receiver) = mpsc::channel(3);
                             let ice_sender = Arc::new(ice_sender);
@@ -212,7 +234,7 @@ impl<S: UpgradeTransportServer> UpgradeWebRTCServer<S> {
                                 }
                             }
 
-                            on_success(peer, ServerHandle(close_sender.clone())).await;
+                            on_success(peer, channel_recv, ServerHandle(close_sender.clone())).await;
                         }
                     }));
                 }

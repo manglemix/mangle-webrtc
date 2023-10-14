@@ -1,6 +1,6 @@
 use std::{fmt::Display, fs::File, io::BufReader, path::Path, sync::Arc};
 
-use rcgen::{KeyPair, generate_simple_self_signed, CertificateParams};
+use rcgen::{generate_simple_self_signed, CertificateParams, KeyPair};
 use serde::{Deserialize, Serialize};
 use tokio_rustls::{
     rustls::{self, ClientConfig, RootCertStore, ServerConfig},
@@ -91,13 +91,14 @@ pub(crate) fn new_tls_acceptor(config: &TlsServerConfig) -> Result<TlsAcceptor, 
                 "There must be at least one certificate in the root cert chain file",
             )));
         };
-        parent_cert = rcgen::Certificate::from_params(CertificateParams::from_ca_cert_der(parent_cert_der, parent_key)?)?;
-
+        parent_cert = rcgen::Certificate::from_params(CertificateParams::from_ca_cert_der(
+            parent_cert_der,
+            parent_key,
+        )?)?;
     } else if config.create_if_missing {
         parent_cert = generate_simple_self_signed([])?;
         std::fs::write(parent_certs_path, parent_cert.serialize_pem()?)?;
         std::fs::write(parent_key_path, parent_cert.get_key_pair().serialize_pem())?;
-
     } else {
         return Err(TlsInitError::IOError(std::io::Error::new(
             std::io::ErrorKind::NotFound,

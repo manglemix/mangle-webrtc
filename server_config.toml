@@ -2,3 +2,6 @@ root_cert_chain_path = "root_cert.pem"
 parent_key_path = "root_key.pem"
 subject_alt_names = ["rrr"]
 create_if_missing = true
+channels = [
+    {"UDP" = { "port" = 64632 }}
+]
