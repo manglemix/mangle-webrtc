@@ -12,6 +12,28 @@ pub mod transport;
 
 pub use webrtc;
 
+pub const STUN_SERVERS: [&str; 19] = [
+    "stun.l.google.com:19302",
+    "stun1.l.google.com:19302",
+    "stun2.l.google.com:19302",
+    "stun3.l.google.com:19302",
+    "stun4.l.google.com:19302",
+    "stun01.sipphone.com",
+    "stun.ekiga.net",
+    "stun.fwdnet.net",
+    "stun.ideasip.com",
+    "stun.iptel.org",
+    "stun.rixtelecom.se",
+    "stun.schlund.de",
+    "stunserver.org",
+    "stun.softjoys.com",
+    "stun.voiparound.com",
+    "stun.voipbuster.com",
+    "stun.voipstunt.com",
+    "stun.voxgratia.org",
+    "stun.xten.com"
+];
+
 /// Configuration for a data channel that is equivalent to a TCP connection
 pub const TCP_DATA_CHANNEL: RTCDataChannelInit = RTCDataChannelInit {
     ordered: Some(true),
@@ -62,7 +84,7 @@ mod tests {
         let handle = tokio::spawn(async move {
             server
                 .run::<_, _>(
-                    move |p, _, _| async move {
+                    move |p, _, _, _| async move {
                         server_sender.send(p).await.unwrap();
                     },
                     |e, _| async move { panic!("Server Error: {e:?}") },

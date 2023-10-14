@@ -10,18 +10,24 @@ use anyhow::anyhow;
 use bytes::Bytes;
 use clap::{Parser, Subcommand};
 use fxhash::FxHashMap;
+use log::info;
 use serde::Deserialize;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt, BufStream},
-    net::{TcpStream, UdpSocket, TcpListener},
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{UdpSocket, TcpListener},
     sync::mpsc, task::JoinSet,
 };
 use upgrade2webrtc::{
     client::{client_new_local_socket, client_new_tcp, PeerAndChannels, ServerName},
-    server::{server_new_local_socket, server_new_tcp},
-    tls::TlsServerConfig,
-    webrtc::{data_channel::{data_channel_init::RTCDataChannelInit, RTCDataChannel}, peer_connection::RTCPeerConnection},
+    webrtc::{data_channel::data_channel_init::RTCDataChannelInit, peer_connection::RTCPeerConnection},
     RELIABLE_UNORDERED_DATA_CHANNEL, TCP_DATA_CHANNEL, UDP_DATA_CHANNEL,
+};
+#[cfg(feature = "server")]
+use upgrade2webrtc::{server::{server_new_local_socket, server_new_tcp}, tls::TlsServerConfig, webrtc::data_channel::RTCDataChannel};
+#[cfg(feature = "server")]
+use tokio::{
+    io::BufStream,
+    net::TcpStream,
 };
 
 const UDP_PACKET_SIZE: usize = 512;
@@ -66,6 +72,7 @@ enum Channel {
 //     }
 // }
 
+#[cfg(feature = "server")]
 #[derive(Deserialize)]
 pub struct ServerConfig {
     /// The path to the root certificate.
@@ -203,6 +210,7 @@ async fn main() -> anyhow::Result<()> {
             };
             let init_channel = channels.pop().unwrap();
             init_channel.1.close().await?;
+            info!("Successfully connected to server");
 
             struct PeerWrapper(Option<RTCPeerConnection>);
 
@@ -347,13 +355,13 @@ async fn main() -> anyhow::Result<()> {
                                 }
                             }
                         }
-                        Channel::LocalSocket { addr, quality } => todo!(),
+                        Channel::LocalSocket { addr: _, quality: _ } => todo!(),
                     }
                 });
             }
 
             let _ = peer.close().await;
-            return Err(tasks.join_next().await.unwrap()?.unwrap_err())
+            Err(tasks.join_next().await.unwrap()?.unwrap_err())
         }
 
         #[cfg(feature = "server")]
@@ -376,7 +384,9 @@ async fn main() -> anyhow::Result<()> {
 
             let on_success = move |_peer,
                                    mut channels_recv: mpsc::Receiver<Arc<RTCDataChannel>>,
+                                   transport_id,
                                    _| async move {
+                info!("New connection from {transport_id}");
                 loop {
                     let Some(data_channel) = channels_recv.recv().await else {
                         break;
@@ -495,7 +505,7 @@ async fn main() -> anyhow::Result<()> {
                                 }
                             }
                         }
-                        Channel::LocalSocket { addr, .. } => {}
+                        Channel::LocalSocket { addr: _, .. } => {}
                     }
                 }
             };
@@ -534,8 +544,9 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
             }
+
+            Ok(())
         }
     }
 
-    Ok(())
 }

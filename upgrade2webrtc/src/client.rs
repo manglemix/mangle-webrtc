@@ -24,7 +24,7 @@ use webrtc::{
 use crate::{
     tls::{new_tls_connector, TlsInitError},
     transport::{IDUpgradeTransport, RecvError, StreamTransport, UpgradeTransport},
-    RTCMessage,
+    RTCMessage, STUN_SERVERS,
 };
 
 pub struct UpgradeWebRTCClient<C: UpgradeTransport> {
@@ -108,7 +108,7 @@ impl<C: UpgradeTransport> UpgradeWebRTCClient<C> {
                 .build(),
             config: RTCConfiguration {
                 ice_servers: vec![RTCIceServer {
-                    urls: vec!["stun:stun.l.google.com:19302".to_owned()],
+                    urls: STUN_SERVERS.map(Into::into).to_vec(),
                     ..Default::default()
                 }],
                 ..Default::default()

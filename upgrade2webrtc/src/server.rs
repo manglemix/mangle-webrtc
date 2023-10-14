@@ -84,7 +84,7 @@ impl<S: UpgradeTransportServer> UpgradeWebRTCServer<S> {
             ),
             config: RTCConfiguration {
                 ice_servers: vec![RTCIceServer {
-                    urls: vec!["stun:stun.l.google.com:19302".to_owned()],
+                    urls: STUN_SERVERS.map(Into::into).to_vec(),
                     ..Default::default()
                 }],
                 ..Default::default()
@@ -94,7 +94,7 @@ impl<S: UpgradeTransportServer> UpgradeWebRTCServer<S> {
 
     pub async fn run<F1, F2>(
         &mut self,
-        on_success: impl Fn(RTCPeerConnection, mpsc::Receiver<Arc<RTCDataChannel>>, ServerHandle) -> F1
+        on_success: impl Fn(RTCPeerConnection, mpsc::Receiver<Arc<RTCDataChannel>>, String, ServerHandle) -> F1
             + Send
             + Sync
             + 'static,
@@ -234,7 +234,7 @@ impl<S: UpgradeTransportServer> UpgradeWebRTCServer<S> {
                                 }
                             }
 
-                            on_success(peer, channel_recv, ServerHandle(close_sender.clone())).await;
+                            on_success(peer, channel_recv, transport.get_id(), ServerHandle(close_sender.clone())).await;
                         }
                     }));
                 }
