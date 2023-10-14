@@ -15,20 +15,17 @@ jobs:
       uses: taiki-e/install-action@v2
       with:
         tool: cross
-      
-    - name: Install nightly
-      run: rustup install nightly
     
     - name: Build Linux
-      run: cargo +nightly build -p webrtc-tunnel
+      run: cargo build -p webrtc-tunnel
     
     - name: Build Windows
-      run: cross +nightly build --target x86_64-pc-windows-gnu -p webrtc-tunnel
+      run: cross build --target x86_64-pc-windows-gnu -p webrtc-tunnel
     
     - name: Build Mac Intel
       uses: Shogan/rust-musl-action@v1.0.2
       with:
-        args: rustup install nightly && cargo +nightly build --target x86_64-apple-darwin
+        args: cargo build --target x86_64-apple-darwin
     
     - name: Debug
       run: ls target/x86_64-apple-darwin/debug

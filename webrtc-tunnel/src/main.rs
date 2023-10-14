@@ -1,4 +1,3 @@
-#![feature(slice_as_chunks)]
 use std::{
     net::{Ipv4Addr, SocketAddrV4, SocketAddr},
     num::NonZeroU16,

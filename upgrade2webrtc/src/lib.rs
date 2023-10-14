@@ -1,5 +1,3 @@
-#![feature(ptr_from_ref)]
-
 use serde::{Deserialize, Serialize};
 use webrtc::{
     data_channel::data_channel_init::RTCDataChannelInit,
