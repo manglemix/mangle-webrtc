@@ -33,7 +33,8 @@ jobs:
       run: cross build --target x86_64-pc-windows-gnu -p webrtc-tunnel
 
     - name: Rename server
-      run: mv target/x86_64-pc-windows-gnu/debug/webrtc-tunnel.exe target/x86_64-pc-windows-gnu/debug/webrtc-tunnel-client.exe && \
+      run: |
+        mv target/x86_64-pc-windows-gnu/debug/webrtc-tunnel.exe target/x86_64-pc-windows-gnu/debug/webrtc-tunnel-client.exe
         mv target/debug/webrtc-tunnel target/debug/webrtc-tunnel-client
     
     # - name: Build Mac Intel
