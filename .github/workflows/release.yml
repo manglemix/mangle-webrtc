@@ -22,13 +22,13 @@ jobs:
     - name: Build Windows
       run: cross build --target x86_64-pc-windows-gnu -p webrtc-tunnel
     
-    - name: Build Mac Intel
-      uses: Shogan/rust-musl-action@v1.0.2
-      with:
-        args: cargo build --target x86_64-apple-darwin
+    # - name: Build Mac Intel
+    #   uses: Shogan/rust-musl-action@v1.0.2
+    #   with:
+    #     args: cargo build --target x86_64-apple-darwin
     
-    - name: Debug
-      run: ls target/x86_64-apple-darwin/debug
+    # - name: Debug
+    #   run: ls target/x86_64-apple-darwin/debug
     
     - name: Release
       uses: softprops/action-gh-release@v1
