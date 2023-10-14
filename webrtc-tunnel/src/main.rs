@@ -1,6 +1,6 @@
 #![feature(slice_as_chunks)]
 use std::{
-    net::{Ipv4Addr, SocketAddrV4},
+    net::{Ipv4Addr, SocketAddrV4, SocketAddr},
     num::NonZeroU16,
     sync::{Arc, atomic::AtomicUsize},
     time::SystemTime, ops::{DerefMut, Deref}, collections::hash_map::Entry,
@@ -14,7 +14,7 @@ use fxhash::FxHashMap;
 use serde::Deserialize;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, BufStream},
-    net::{TcpStream, UdpSocket},
+    net::{TcpStream, UdpSocket, TcpListener},
     sync::mpsc, task::JoinSet,
 };
 use upgrade2webrtc::{
@@ -159,13 +159,9 @@ async fn main() -> anyhow::Result<()> {
             let config: ClientConfig =
                 toml::from_str(std::fs::read_to_string(config_path)?.as_str())?;
 
-            // let channels: Vec<_> = config
-            //     .channels
-            //     .into_iter()
-            //     .map(|x| Into::<(String, RTCDataChannelInit)>::into(x))
-            //     .collect();
-
-            // let channels = channels.iter().map(|x| (x.0.as_str(), x.1.clone()));
+            if config.channels.is_empty() {
+                return Err(anyhow::anyhow!("No channels provided"))
+            }
             let init_channels = [("init", TCP_DATA_CHANNEL)];
 
             let PeerAndChannels { peer, mut channels } = match stream_type {
@@ -236,7 +232,7 @@ async fn main() -> anyhow::Result<()> {
 
             let peer = Arc::new(PeerWrapper(Some(peer)));
             let channel_counter = Arc::new(AtomicUsize::new(0));
-            let mut tasks = JoinSet::new();
+            let mut tasks = JoinSet::<anyhow::Result<()>>::new();
 
             for channel in config.channels {
                 let peer = peer.clone();
@@ -245,41 +241,120 @@ async fn main() -> anyhow::Result<()> {
                     match channel {
                         Channel::UDP { port, quality } => {
                             let quality = quality.expect(&format!("Missing quality setting for port {port}"));
-                            let listener = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port.get())).await?;
+                            let listener_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port.get());
+                            let listener = UdpSocket::bind(listener_addr).await?;
                             let mut buf = vec![0u8; UDP_PACKET_SIZE];
-                            let mut existing_channel_senders = FxHashMap::default();
+                            let mut existing_channel_senders: FxHashMap<SocketAddr, mpsc::Sender<Bytes>> = FxHashMap::default();
     
-                            tokio::select! {
-                                result = listener.recv_buf_from(&mut buf) => {
-                                    let (n, addr) = result?;
-                                    let buf = buf.as_slice().split_at(n).0;
-                                    
-                                    match existing_channel_senders.entry(addr) {
-                                        Entry::Occupied(_) => todo!(),
-                                        Entry::Vacant(x) => {
-                                            let (sender, receiver) = mpsc::channel(3);
-    
-                                            let channel_idx = channel_counter.fetch_add(1, Ordering::Relaxed);
-                                            peer.create_data_channel(&channel_idx.to_string(), Some(quality.into())).await?;
-    
-                                            tokio::spawn(async move {
-    
-                                            });
-    
-                                            x.insert(sender);
+                            loop {
+                                tokio::select! {
+                                    result = listener.recv_buf_from(&mut buf) => {
+                                        let (n, addr) = result?;
+                                        let buf = Bytes::from(buf.as_slice().split_at(n).0.to_vec());
+                                        
+                                        match existing_channel_senders.entry(addr) {
+                                            Entry::Occupied(x) => {
+                                                if x.get().send(buf).await.is_err() {
+                                                    x.remove();
+                                                }
+                                            }
+                                            Entry::Vacant(x) => {
+                                                let socket = UdpSocket::bind(listener_addr).await?;
+                                                socket.connect(addr).await?;
+
+                                                let (listener_bytes_sender, mut listener_bytes_receiver) = mpsc::channel(3);
+        
+                                                let channel_idx = channel_counter.fetch_add(1, Ordering::Relaxed);
+                                                let data_channel = peer.create_data_channel(&channel_idx.to_string(), Some(quality.into())).await?;
+                                                listener_bytes_sender.try_send(buf).unwrap();
+                                                
+                                                let (webrtc_bytes_sender, mut webrtc_bytes_recv) = mpsc::channel(2);
+                                                let bytes_sender = Arc::new(webrtc_bytes_sender);
+
+                                                data_channel.on_message(Box::new(move |msg| {
+                                                    let bytes_sender = bytes_sender.clone();
+                                                    Box::pin(async move {
+                                                        let _ = bytes_sender.send(msg.data).await;
+                                                    })
+                                                }));
+        
+                                                tokio::spawn(async move {
+                                                    loop {
+                                                        tokio::select! {
+                                                            result = listener_bytes_receiver.recv() => {
+                                                                let Some(bytes) = result else { break };
+                                                                let mut sent_n = 0;
+                                                                while sent_n < bytes.len() {
+                                                                    sent_n += data_channel.send(&bytes.slice(sent_n..)).await.unwrap();
+                                                                }
+                                                            }
+                                                            result = webrtc_bytes_recv.recv() => {
+                                                                let Some(bytes) = result else { break };
+                                                                socket.send(&bytes).await.unwrap();
+                                                            }
+                                                        }
+                                                    }
+                                                });
+        
+                                                x.insert(listener_bytes_sender);
+                                            }
                                         }
                                     }
                                 }
                             }
                         }
-                        Channel::TCP { port, quality } => todo!(),
+                        Channel::TCP { port, quality } => {
+                            let quality = quality.expect(&format!("Missing quality setting for port {port}"));
+                            let listener_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port.get());
+                            let listener = TcpListener::bind(listener_addr).await?;
+    
+                            loop {
+                                tokio::select! {
+                                    result = listener.accept() => {
+                                        let (mut stream, _) = result?;
+                                        let channel_idx = channel_counter.fetch_add(1, Ordering::Relaxed);
+                                        let data_channel = peer.create_data_channel(&channel_idx.to_string(), Some(quality.into())).await?;
+                                                
+                                        let (webrtc_bytes_sender, mut webrtc_bytes_recv) = mpsc::channel(2);
+                                        let bytes_sender = Arc::new(webrtc_bytes_sender);
+
+                                        data_channel.on_message(Box::new(move |msg| {
+                                            let bytes_sender = bytes_sender.clone();
+                                            Box::pin(async move {
+                                                let _ = bytes_sender.send(msg.data).await;
+                                            })
+                                        }));
+
+                                        tokio::spawn(async move {
+                                            let mut buf = vec![0u8; 2048];
+                                            loop {
+                                                tokio::select! {
+                                                    result = stream.read(&mut buf) => {
+                                                        let n = result.unwrap();
+                                                        let bytes = Bytes::from(buf.split_at(n).0.to_vec());
+                                                        let mut sent_n = 0;
+                                                        while sent_n < n {
+                                                            sent_n += data_channel.send(&bytes.slice(n..)).await.unwrap();
+                                                        }
+                                                    }
+                                                    result = webrtc_bytes_recv.recv() => {
+                                                        let Some(bytes) = result else { break };
+                                                        stream.write_all(&bytes).await.unwrap();
+                                                    }
+                                                }
+                                            }
+                                        });
+                                    }
+                                }
+                            }
+                        }
                         Channel::LocalSocket { addr, quality } => todo!(),
                     }
-                    Ok(())
                 });
             }
 
             let _ = peer.close().await;
+            return Err(tasks.join_next().await.unwrap()?.unwrap_err())
         }
 
         #[cfg(feature = "server")]
