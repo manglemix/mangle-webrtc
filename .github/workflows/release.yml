@@ -9,7 +9,8 @@ jobs:
 
     - uses: Swatinem/rust-cache@v2
       with:
-        workspaces: "target"
+        shared-key: "default"
+        key: "default"
     
     - name: Install Cross
       uses: taiki-e/install-action@v2
