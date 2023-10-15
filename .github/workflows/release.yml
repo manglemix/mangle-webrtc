@@ -58,6 +58,7 @@ jobs:
     #   run: ls target/x86_64-apple-darwin/debug
 
     - name: Compress
+      continue-on-error: true
       run: |
         ./upx --best target/x86_64-pc-windows-gnu/debug/webrtc-tunnel-client.exe
         ./upx --best target/debug/webrtc-tunnel-client
