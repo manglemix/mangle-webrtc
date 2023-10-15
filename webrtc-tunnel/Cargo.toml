@@ -22,5 +22,9 @@ fxhash = "0.2"
 [features]
 server = []
 
+[profile.dev]
+opt-level = 1
+lto = "thin"
+
 [profile.release]
 lto = true
