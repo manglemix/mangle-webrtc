@@ -21,3 +21,6 @@ fxhash = "0.2"
 
 [features]
 server = []
+
+[profile.release]
+lto = true
