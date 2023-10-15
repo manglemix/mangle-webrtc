@@ -7,6 +7,9 @@ jobs:
     steps:
     - uses: actions/checkout@v3.5.3
 
+    - name: Cargo Test
+      run: cargo test
+
     - uses: Swatinem/rust-cache@v2
       with:
         shared-key: "default"
