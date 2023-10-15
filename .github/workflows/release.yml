@@ -7,13 +7,20 @@ jobs:
     steps:
     - uses: actions/checkout@v3.5.3
 
+    - name: Install UPX
+      run: |
+        curl -L https://github.com/upx/upx/releases/download/v4.1.0/upx-4.1.0-amd64_linux.tar.xz > upx.tar.xz
+        tar -xf upx.tar.xz
+        mv upx-4.1.0-amd64_linux/upx ./upx
+
     - name: Cargo Test
       run: cargo test
 
-    - uses: Swatinem/rust-cache@v2
-      with:
-        shared-key: "default"
-        key: "default"
+    # - uses: Swatinem/rust-cache@v2
+    #   with:
+    #     shared-key: "default"
+    #     key: "default"
+    #     cache-on-failure: "true"
     
     - name: Install Cross
       uses: taiki-e/install-action@v2
@@ -49,6 +56,13 @@ jobs:
     
     # - name: Debug
     #   run: ls target/x86_64-apple-darwin/debug
+
+    - name: Compress
+      run: |
+        ./upx --best target/x86_64-pc-windows-gnu/debug/webrtc-tunnel-client.exe
+        ./upx --best target/debug/webrtc-tunnel-client
+        ./upx --best target/x86_64-pc-windows-gnu/debug/webrtc-tunnel-server.exe
+        ./upx --best target/debug/webrtc-tunnel-server
     
     - name: Release
       uses: softprops/action-gh-release@v1
