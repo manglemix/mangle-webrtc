@@ -3,19 +3,19 @@ use std::{
     num::NonZeroU16,
     sync::{Arc, atomic::AtomicUsize},
     time::SystemTime, ops::{DerefMut, Deref}, collections::hash_map::Entry,
-    sync::atomic::Ordering
+    sync::atomic::Ordering, future::Future, pin::Pin
 };
 
 use anyhow::anyhow;
 use bytes::Bytes;
 use clap::{Parser, Subcommand};
 use fxhash::FxHashMap;
-use log::info;
+use log::{info, error};
 use serde::Deserialize;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{UdpSocket, TcpListener},
-    sync::mpsc, task::JoinSet,
+    sync::{mpsc, broadcast, oneshot}, task::JoinSet,
 };
 use upgrade2webrtc::{
     client::{client_new_local_socket, client_new_tcp, PeerAndChannels, ServerName},
@@ -51,9 +51,9 @@ impl Into<RTCDataChannelInit> for Quality {
 
 #[derive(Deserialize)]
 enum Channel {
-    UDP { port: NonZeroU16, quality: Option<Quality> },
-    TCP { port: NonZeroU16, quality: Option<Quality> },
-    LocalSocket { addr: String, quality: Option<Quality> },
+    UDP { port: NonZeroU16, remap: Option<NonZeroU16>, quality: Option<Quality> },
+    TCP { port: NonZeroU16, remap: Option<NonZeroU16>, quality: Option<Quality> },
+    LocalSocket { addr: String, remap: Option<NonZeroU16>, quality: Option<Quality> },
 }
 
 // impl Into<(String, RTCDataChannelInit)> for Channel {
@@ -240,15 +240,18 @@ async fn main() -> anyhow::Result<()> {
             let peer = Arc::new(PeerWrapper(Some(peer)));
             let channel_counter = Arc::new(AtomicUsize::new(0));
             let mut tasks = JoinSet::<anyhow::Result<()>>::new();
+            let (end_sender, _) = broadcast::channel::<()>(1);
 
             for channel in config.channels {
                 let peer = peer.clone();
                 let channel_counter = channel_counter.clone();
+                let mut end_receiver = end_sender.subscribe();
+
                 tasks.spawn(async move {
                     match channel {
-                        Channel::UDP { port, quality } => {
+                        Channel::UDP { port, quality, remap } => {
                             let quality = quality.expect(&format!("Missing quality setting for port {port}"));
-                            let listener_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port.get());
+                            let listener_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, remap.unwrap_or(port).get());
                             let listener = UdpSocket::bind(listener_addr).await?;
                             let mut buf = vec![0u8; UDP_PACKET_SIZE];
                             let mut existing_channel_senders: FxHashMap<SocketAddr, mpsc::Sender<Bytes>> = FxHashMap::default();
@@ -272,7 +275,9 @@ async fn main() -> anyhow::Result<()> {
                                                 let (listener_bytes_sender, mut listener_bytes_receiver) = mpsc::channel(3);
         
                                                 let channel_idx = channel_counter.fetch_add(1, Ordering::Relaxed);
-                                                let data_channel = peer.create_data_channel(&channel_idx.to_string(), Some(quality.into())).await?;
+                                                let mut config: RTCDataChannelInit = quality.into();
+                                                config.protocol = Some(port.to_string());
+                                                let data_channel = peer.create_data_channel(&channel_idx.to_string(), Some(config)).await?;
                                                 listener_bytes_sender.try_send(buf).unwrap();
                                                 
                                                 let (webrtc_bytes_sender, mut webrtc_bytes_recv) = mpsc::channel(2);
@@ -307,12 +312,15 @@ async fn main() -> anyhow::Result<()> {
                                             }
                                         }
                                     }
+                                    _ = end_receiver.recv() => {
+                                        break Ok(())
+                                    }
                                 }
                             }
                         }
-                        Channel::TCP { port, quality } => {
+                        Channel::TCP { port, quality, remap } => {
                             let quality = quality.expect(&format!("Missing quality setting for port {port}"));
-                            let listener_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port.get());
+                            let listener_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, remap.unwrap_or(port).get());
                             let listener = TcpListener::bind(listener_addr).await?;
     
                             loop {
@@ -320,8 +328,23 @@ async fn main() -> anyhow::Result<()> {
                                     result = listener.accept() => {
                                         let (mut stream, _) = result?;
                                         let channel_idx = channel_counter.fetch_add(1, Ordering::Relaxed);
-                                        let data_channel = peer.create_data_channel(&channel_idx.to_string(), Some(quality.into())).await?;
-                                                
+                                        info!("New TCP connection ID: {channel_idx}");
+                                        let mut config: RTCDataChannelInit = quality.into();
+                                        config.protocol = Some(port.to_string());
+                                        let data_channel = peer.create_data_channel(&channel_idx.to_string(), Some(config)).await?;
+
+                                        let (open_sender, open_receiver) = oneshot::channel();
+
+                                        data_channel.on_open(Box::new(move || {
+                                            let _ = open_sender.send(());
+                                            Box::pin(std::future::ready(()))
+                                        }));
+
+                                        if open_receiver.await.is_err() {
+                                            error!("Failed to initialize data channel for ID: {channel_idx}");
+                                            continue
+                                        }
+
                                         let (webrtc_bytes_sender, mut webrtc_bytes_recv) = mpsc::channel(2);
                                         let bytes_sender = Arc::new(webrtc_bytes_sender);
 
@@ -331,6 +354,7 @@ async fn main() -> anyhow::Result<()> {
                                                 let _ = bytes_sender.send(msg.data).await;
                                             })
                                         }));
+                                        info!("Data channel for ID: {channel_idx} established");
 
                                         tokio::spawn(async move {
                                             let mut buf = vec![0u8; 2048];
@@ -340,8 +364,12 @@ async fn main() -> anyhow::Result<()> {
                                                         let n = result.unwrap();
                                                         let bytes = Bytes::from(buf.split_at(n).0.to_vec());
                                                         let mut sent_n = 0;
+                                                        info!("Sending {n} bytes");
                                                         while sent_n < n {
                                                             sent_n += data_channel.send(&bytes.slice(n..)).await.unwrap();
+                                                            if sent_n > 0 {
+                                                                info!("Sent {sent_n} bytes so far");
+                                                            }
                                                         }
                                                     }
                                                     result = webrtc_bytes_recv.recv() => {
@@ -352,16 +380,53 @@ async fn main() -> anyhow::Result<()> {
                                             }
                                         });
                                     }
+                                    _ = end_receiver.recv() => {
+                                        break Ok(())
+                                    }
                                 }
                             }
                         }
-                        Channel::LocalSocket { addr: _, quality: _ } => todo!(),
+                        Channel::LocalSocket {addr:_,quality:_, remap:_ } => todo!(),
                     }
                 });
             }
+            
+            let mut ctrl_c_fut: Pin<Box<dyn Future<Output=std::io::Result<()>>>> = Box::pin(tokio::signal::ctrl_c());
 
+            let result = loop {
+                tokio::select! {
+                    result = ctrl_c_fut => {
+                        if let Err(e) = result {
+                            error!("Failed to check for Ctrl-C: {e}");
+                            ctrl_c_fut = Box::pin(std::future::pending::<std::io::Result<()>>());
+                            continue
+                        }
+                        break Ok(())
+                    }
+                    result = tasks.join_next() => {
+                        let result = result.unwrap().map_err(anyhow::Error::from);
+
+                        let result = match result {
+                            Ok(x) => x,
+                            Err(e) => Err(e)
+                        };
+
+                        break result
+                    }
+                }
+            };
+            
+            if result.is_err() {
+                return result
+            }
+            info!("Received Ctrl-C");
+
+            tasks.abort_all();
             let _ = peer.close().await;
-            Err(tasks.join_next().await.unwrap()?.unwrap_err())
+            info!("WebRTC Peer closed");
+            drop(end_sender);
+            while tasks.join_next().await.is_some() {}
+            Ok(())
         }
 
         #[cfg(feature = "server")]
@@ -374,6 +439,14 @@ async fn main() -> anyhow::Result<()> {
 
             let mut channels = FxHashMap::default();
             for channel in config.channels {
+                let had_remap = match &channel {
+                    Channel::UDP { remap, .. } => remap.is_some(),
+                    Channel::TCP { remap, .. } => remap.is_some(),
+                    Channel::LocalSocket { remap, .. } => remap.is_some(),
+                };
+                if had_remap {
+                    return Err(anyhow::anyhow!("remap is a parameter that is used in client configs, not server configs"))
+                }
                 match &channel {
                     Channel::UDP { port, .. } => channels.insert(port.to_string(), channel),
                     Channel::TCP { port, .. } => channels.insert(port.to_string(), channel),
@@ -469,6 +542,7 @@ async fn main() -> anyhow::Result<()> {
                             let bytes_sender = Arc::new(bytes_sender);
 
                             data_channel.on_message(Box::new(move |msg| {
+                                info!("Received bytes");
                                 let bytes_sender = bytes_sender.clone();
                                 Box::pin(async move {
                                     let _ = bytes_sender.send(msg.data).await;
@@ -512,7 +586,7 @@ async fn main() -> anyhow::Result<()> {
 
             macro_rules! on_err {
                 () => {
-                    |err, _| async move { panic!("{err}") }
+                    |err, _| async move { panic!("LMao {err}") }
                 };
             }
             let tls_config = TlsServerConfig {

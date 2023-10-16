@@ -2046,6 +2046,7 @@ dependencies = [
  "bitcode",
  "hex",
  "interprocess",
+ "log",
  "rcgen",
  "rustls-pemfile",
  "serde",

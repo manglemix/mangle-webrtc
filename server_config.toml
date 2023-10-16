@@ -3,5 +3,5 @@ parent_key_path = "root_key.pem"
 subject_alt_names = ["rrr"]
 create_if_missing = true
 channels = [
-    {"UDP" = { "port" = 64632 }}
+    {"TCP" = { "port" = 8002 }}
 ]

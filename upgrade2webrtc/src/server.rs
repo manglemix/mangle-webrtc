@@ -1,10 +1,11 @@
 use std::{fmt::Display, future::Future, sync::Arc};
 
 use async_trait::async_trait;
+use log::error;
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     net::{TcpListener, ToSocketAddrs},
-    sync::mpsc,
+    sync::{mpsc, oneshot},
 };
 use tokio_rustls::TlsAcceptor;
 use webrtc::{
@@ -175,10 +176,25 @@ impl<S: UpgradeTransportServer> UpgradeWebRTCServer<S> {
 
                             let (channel_sender, channel_recv) = mpsc::channel(1);
                             let channel_sender = Arc::new(channel_sender);
+                            let transport_id = Arc::new(transport.get_id());
 
                             peer.on_data_channel(Box::new(move |data_channel| {
                                 let channel_sender = channel_sender.clone();
-                                Box::pin(async move { let _ = channel_sender.send(data_channel).await; })
+                                let transport_id = transport_id.clone();
+                                
+                                Box::pin(async move {
+                                    let (open_sender, open_receiver) = oneshot::channel();
+
+                                    data_channel.on_open(Box::new(move || {
+                                        let _ = open_sender.send(());
+                                        Box::pin(std::future::ready(()))
+                                    }));
+
+                                    if open_receiver.await.is_err() {
+                                        error!("Failed to initialize data channel for ID: {transport_id}");
+                                    }
+                                    let _ = channel_sender.send(data_channel).await;
+                                })
                             }));
 
                             let (ice_sender, mut ice_receiver) = mpsc::channel(3);
