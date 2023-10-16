@@ -12,6 +12,7 @@ bytes = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 log = { workspace = true }
+# static_assertions = { workspace = true }
 # interprocess = { workspace = true }
 fxhash = { workspace = true }
 toml = "0.8"

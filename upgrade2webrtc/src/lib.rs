@@ -31,7 +31,7 @@ pub const STUN_SERVERS: [&str; 19] = [
     "stun:stun.voipbuster.com",
     "stun:stun.voipstunt.com",
     "stun:stun.voxgratia.org",
-    "stun:stun.xten.com"
+    "stun:stun.xten.com",
 ];
 
 /// Configuration for a data channel that is equivalent to a TCP connection

@@ -27,8 +27,7 @@ use crate::{
     transport::{
         IDUpgradeTransport, RecvError, StreamTransport, UpgradeTransport, UpgradeTransportServer,
     },
-    RTCMessage,
-    STUN_SERVERS
+    RTCMessage, STUN_SERVERS,
 };
 
 pub struct ServerHandle(mpsc::Sender<()>);
@@ -181,7 +180,7 @@ impl<S: UpgradeTransportServer> UpgradeWebRTCServer<S> {
                             peer.on_data_channel(Box::new(move |data_channel| {
                                 let channel_sender = channel_sender.clone();
                                 let transport_id = transport_id.clone();
-                                
+
                                 Box::pin(async move {
                                     let (open_sender, open_receiver) = oneshot::channel();
 
