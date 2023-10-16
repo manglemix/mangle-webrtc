@@ -53,7 +53,7 @@ impl Into<RTCDataChannelInit> for Quality {
 enum Channel {
     UDP { port: NonZeroU16, remap: Option<NonZeroU16>, quality: Option<Quality> },
     TCP { port: NonZeroU16, remap: Option<NonZeroU16>, quality: Option<Quality> },
-    LocalSocket { addr: String, remap: Option<NonZeroU16>, quality: Option<Quality> },
+    LocalSocket { addr: String, remap: Option<String>, quality: Option<Quality> },
 }
 
 // impl Into<(String, RTCDataChannelInit)> for Channel {
@@ -439,18 +439,10 @@ async fn main() -> anyhow::Result<()> {
 
             let mut channels = FxHashMap::default();
             for channel in config.channels {
-                let had_remap = match &channel {
-                    Channel::UDP { remap, .. } => remap.is_some(),
-                    Channel::TCP { remap, .. } => remap.is_some(),
-                    Channel::LocalSocket { remap, .. } => remap.is_some(),
-                };
-                if had_remap {
-                    return Err(anyhow::anyhow!("remap is a parameter that is used in client configs, not server configs"))
-                }
                 match &channel {
-                    Channel::UDP { port, .. } => channels.insert(port.to_string(), channel),
-                    Channel::TCP { port, .. } => channels.insert(port.to_string(), channel),
-                    Channel::LocalSocket { addr, .. } => channels.insert(addr.clone(), channel),
+                    Channel::UDP { port, remap, .. } => channels.insert(remap.as_ref().unwrap_or(port).to_string(), channel),
+                    Channel::TCP { port, remap, .. } => channels.insert(remap.as_ref().unwrap_or(port).to_string(), channel),
+                    Channel::LocalSocket { addr, remap, .. } => channels.insert(remap.as_ref().unwrap_or(addr).clone(), channel),
                 };
             }
             let channels: &_ = Box::leak(Box::new(channels));

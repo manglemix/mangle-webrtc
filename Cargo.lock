@@ -2057,6 +2057,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "upgrade2webrtc"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5d9a54b55392086a807c7cf562429bf8a051415834d43ff7adfd6b014a7ba573"
+dependencies = [
+ "async-trait",
+ "bitcode",
+ "hex",
+ "interprocess",
+ "log",
+ "rcgen",
+ "rustls-pemfile",
+ "serde",
+ "tokio",
+ "tokio-rustls",
+ "tokio-util",
+ "webrtc",
+]
+
+[[package]]
 name = "url"
 version = "2.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2360,12 +2380,11 @@ dependencies = [
  "fern",
  "fxhash",
  "humantime",
- "interprocess",
  "log",
  "serde",
  "tokio",
  "toml",
- "upgrade2webrtc",
+ "upgrade2webrtc 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]
